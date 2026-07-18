@@ -1,0 +1,327 @@
+# Makefile_PS3 — Polyphase PS3 build, Phase 1 (engine compiles + boots).
+#
+# Single-pass build: compiles the engine source tree + PS3 addon runtime +
+# the project's own source into one PPU .elf, then fake-signs it into a
+# directly-bootable .self (fself) and stages the sprxlinked .elf so the
+# addon's PostPackage can wrap it into an installable .pkg. Mirrors the PSP
+# Makefile layout but adapted for ppu-gcc + PSL1GHT + RSX.
+#
+# Run via the editor's PS3 build-target addon (which invokes this from inside
+# WSL on Windows hosts), OR manually:
+#
+#   make -C <projectDir> -f Makefile_PS3 -j4
+#
+# Requires ps3dev/PSL1GHT installed (default prefix /usr/local/ps3dev) and its
+# tools reachable. The addon's GetCompileCommand emits a `wsl bash -lc` wrapper
+# on Windows hosts and a native `bash -lc` wrapper on POSIX, and passes
+# PS3DEV / PSL1GHT / POLYPHASE_PATH / PROJECT_ROOT on the make line.
+
+# See Makefile_PSP for the full rationale — a failed/interrupted recipe would
+# otherwise leave a 0-byte .o that satisfies the next build's freshness check,
+# producing baffling "undefined reference" link errors. Delete partial outputs.
+.DELETE_ON_ERROR:
+
+# Pin the default goal to `all` (defined near the bottom). REQUIRED because the
+# `-include $(CPPFILES:.cpp=.d)` below pulls in generated dep files whose first
+# target (e.g. `Asset.o:`) would otherwise be adopted as make's default goal on
+# any incremental build where those .d files already exist — making a bare
+# `make` (what the editor runs) build a single object and stop instead of
+# linking. Setting .DEFAULT_GOAL early wins: make only auto-adopts a first
+# target when .DEFAULT_GOAL is still empty.
+.DEFAULT_GOAL := all
+
+# ---- PROJECT_ROOT -----------------------------------------------------------
+# Absolute path to the user's project (where .octp / Source/ / Generated/ /
+# Packages/ live). Resolution priority:
+#   1. Set on the make command line by the PS3 addon's GetCompileCommand. Make
+#      runs from $(PROJECT_ROOT)/Intermediate/PS3/ so all intermediates land
+#      there.
+#   2. Walk-up from $(CURDIR) looking for a *.octp file (the project marker).
+ifeq ($(origin PROJECT_ROOT), undefined)
+PROJECT_ROOT := $(strip \
+    $(if $(wildcard $(CURDIR)/*.octp),         $(CURDIR), \
+    $(if $(wildcard $(CURDIR)/../*.octp),      $(abspath $(CURDIR)/..), \
+    $(if $(wildcard $(CURDIR)/../../*.octp),   $(abspath $(CURDIR)/../..), \
+                                                ))))
+endif
+
+ifeq ($(strip $(PROJECT_ROOT)),)
+$(error Could not locate project root — no *.octp file found within 2 levels \
+  of $(CURDIR). Pass PROJECT_ROOT=/path/to/project on the make line, or invoke \
+  make from your project's root directory or its Intermediate/PS3/ subdirectory.)
+endif
+
+# Normalise: strip trailing slash. GNU make's $(notdir foo/) returns empty, so
+# a trailing-slash PROJECT_ROOT would yield TARGET="" → ".elf" → silent link
+# failure. `override` is REQUIRED — command-line PROJECT_ROOT beats a plain
+# `:=` reassignment, so without it the patsubst is a no-op.
+override PROJECT_ROOT := $(patsubst %/,%,$(PROJECT_ROOT))
+
+ifeq ($(wildcard $(PROJECT_ROOT)/*.octp),)
+$(error Resolved PROJECT_ROOT='$(PROJECT_ROOT)' but it has no *.octp file. \
+  Pass PROJECT_ROOT explicitly on the make line.)
+endif
+
+# TARGET is the project name — directory name of PROJECT_ROOT.
+TARGET   = $(notdir $(PROJECT_ROOT))
+
+# ---- Engine + addon paths ---------------------------------------------------
+# POLYPHASE_PATH resolution: (1) make command line (the addon passes it),
+# (2) environment, (3) walk-up from PROJECT_ROOT for Polyphase.sln,
+# (4) /opt/Polyphase last resort.
+POLYPHASE_PATH ?= $(shell \
+    p=$(PROJECT_ROOT); \
+    for i in 1 2 3 4 5 6; do \
+        p=$$(dirname $$p); \
+        if [ -f $$p/Polyphase.sln ]; then echo $$p; exit 0; fi; \
+    done; \
+    echo /opt/Polyphase )
+
+override POLYPHASE_PATH := $(patsubst %/,%,$(POLYPHASE_PATH))
+
+ifeq ($(wildcard $(POLYPHASE_PATH)/Engine/Source/Engine/Engine.h),)
+$(error POLYPHASE_PATH='$(POLYPHASE_PATH)' does not contain Engine/Source/Engine/Engine.h. \
+  Pass POLYPHASE_PATH=/path/to/polyphase-engine on the make command line (the editor's PS3 \
+  addon does this automatically). Inside WSL, Windows-side paths look like /mnt/<drive>/...)
+endif
+
+ADDON_PS3_RUNTIME = $(PROJECT_ROOT)/Packages/com.polyphase.build.target.ps3/Runtime/PS3
+
+# ---- ps3dev / PSL1GHT prefix ------------------------------------------------
+# The addon passes PS3DEV (and PSL1GHT) on the make line. For manual builds
+# default to the canonical install prefix. PSL1GHT points at the same dir.
+PS3DEV  ?= /usr/local/ps3dev
+PSL1GHT ?= $(PS3DEV)
+
+# Export both into the ENVIRONMENT (not just as make vars): ppu-gcc's spec file
+# reads $PSL1GHT (and $PS3DEV) via getenv at link time to locate the lv2 crt +
+# libs, and the editor invokes make from a non-interactive `bash -lc` that
+# doesn't have them set. Compilation survives without this (include dirs are
+# passed as explicit -I flags), but the final link dies with
+# "environment variable 'PSL1GHT' not defined" unless they're exported here.
+export PS3DEV
+export PSL1GHT
+
+ifeq ($(wildcard $(PS3DEV)/ppu/bin/ppu-gcc),)
+$(error PS3DEV='$(PS3DEV)' has no ppu/bin/ppu-gcc. Install ps3dev/PSL1GHT \
+  (https://github.com/ps3dev/ps3toolchain) to /usr/local/ps3dev, or pass \
+  PS3DEV=/path/to/install on the make line. Inside WSL, use the WSL-side path.)
+endif
+
+# ---- Engine-native addon injection ------------------------------------------
+# The editor writes $(PROJECT_ROOT)/Generated/AddonInject.mk before invoking
+# GetCompileCommand; it DEFINES ADDON_* vars (ADDON_SOURCES, ADDON_DEFINES,
+# ADDON_INCDIR, ADDON_LIBDIR, ADDON_LIBS, ADDON_CPPFILES_EXTRA) so engine-target
+# addons compile into the PS3 build. `-include` is non-fatal when absent.
+-include $(PROJECT_ROOT)/Generated/AddonInject.mk
+
+# ---- Source discovery -------------------------------------------------------
+# PSL1GHT's rules do NOT auto-wildcard, so we expand OFILES ourselves (below).
+# We exclude the desktop/other-console platform subdirs (Source/System/Windows,
+# etc.) — they're hard-guarded by #if PLATFORM_* and would emit zero code.
+SOURCES = \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Assets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Animation \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/3D \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Nodes/Widgets \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Nodes \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/NodeGraph/Domains \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/UI \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline \
+    $(POLYPHASE_PATH)/Engine/Source/Engine/Timeline/Tracks \
+    $(POLYPHASE_PATH)/Engine/Source/Plugins \
+    $(POLYPHASE_PATH)/Engine/Source/System \
+    $(POLYPHASE_PATH)/Engine/Source/Graphics \
+    $(POLYPHASE_PATH)/Engine/Source/Input \
+    $(POLYPHASE_PATH)/Engine/Source/Audio \
+    $(POLYPHASE_PATH)/Engine/Source/Network \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http \
+    $(POLYPHASE_PATH)/Engine/Source/Network/Http/Backends \
+    $(POLYPHASE_PATH)/Engine/Source/Serial/Stub \
+    $(POLYPHASE_PATH)/Engine/Source/LuaBindings \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/IrrXML \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/BroadphaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionDispatch \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/CollisionShapes \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/Gimpact \
+    $(POLYPHASE_PATH)/External/Bullet/BulletCollision/NarrowPhaseCollision \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Character \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/ConstraintSolver \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Dynamics \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Featherstone \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/MLCPSolvers \
+    $(POLYPHASE_PATH)/External/Bullet/BulletDynamics/Vehicle \
+    $(POLYPHASE_PATH)/External/Bullet/LinearMath \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Source \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Source \
+    $(ADDON_PS3_RUNTIME) \
+    $(ADDON_PS3_RUNTIME)/Graphics_PS3RSX \
+    $(PROJECT_ROOT)/Source \
+    $(ADDON_SOURCES)
+
+# ---- Include path -----------------------------------------------------------
+# The PSL1GHT include (-I$(PSL1GHT)/ppu/include ...) is appended below via
+# $(LIBPSL1GHT_INC) which ppu_rules defines.
+INCDIRS = \
+    $(PROJECT_ROOT)/Generated \
+    $(ADDON_PS3_RUNTIME)/compat \
+    $(ADDON_PS3_RUNTIME) \
+    $(ADDON_PS3_RUNTIME)/Graphics_PS3RSX \
+    $(POLYPHASE_PATH)/Engine/Source \
+    $(POLYPHASE_PATH)/Engine/Source/Engine \
+    $(POLYPHASE_PATH)/External \
+    $(POLYPHASE_PATH)/External/Bullet \
+    $(POLYPHASE_PATH)/External/Lua \
+    $(POLYPHASE_PATH)/External/glm \
+    $(POLYPHASE_PATH)/External/Vorbis \
+    $(POLYPHASE_PATH)/External/Assimp/contrib/rapidjson \
+    $(POLYPHASE_PATH)/External/recastnavigation/Recast/Include \
+    $(POLYPHASE_PATH)/External/recastnavigation/Detour/Include \
+    $(POLYPHASE_PATH)/Engine/External/PolyVox/include \
+    $(ADDON_INCDIR)
+
+# ---- Object list ------------------------------------------------------------
+# Every *.cpp / *.c under each SOURCES dir becomes a flat-basename .o in CWD
+# (Intermediate/PS3/), with VPATH telling make where to find the source.
+CPPFILES := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+CFILES   := $(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+
+# Pull in only EmbeddedScripts.cpp from Generated/. EmbeddedAssets.cpp is the
+# large cooked-asset blob; PS3 has 256 MB main RAM so it CAN be embedded later,
+# but for the first bootable milestone we keep the .elf small and load assets
+# from storage at runtime (matching the PSP baseline). Scripts only ship via
+# the embedded path, so this one file is needed for Lua components to run.
+ifneq ($(wildcard $(PROJECT_ROOT)/Generated/EmbeddedScripts.cpp),)
+CPPFILES += EmbeddedScripts.cpp
+endif
+
+# Engine-target addon registrar + any other generated CPP from AddonInject.mk.
+CPPFILES += $(ADDON_CPPFILES_EXTRA)
+
+VPATH  := $(SOURCES) $(PROJECT_ROOT)/Generated
+OFILES := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o)
+
+# Header dependency tracking — PSL1GHT's base_rules emits `-MMD -MP -MF
+# $(DEPSDIR)/$*.d` when DEPSDIR is set, so unlike the PSP build we get correct
+# incremental rebuilds on header changes. Deps land next to the objects.
+DEPSDIR := .
+
+# ---- Flags ------------------------------------------------------------------
+# API_RSX marks the RSX/libgcm graphics backend. POLYPHASE_PLATFORM_ADDON makes
+# the engine's fork headers prefer the addon-provided platform typedefs
+# (Runtime/PS3/*Types_Platform.h via the generated bridge headers).
+DEFINES = \
+    -DPOLYPHASE_PLATFORM_ADDON=1 \
+    -DPLATFORM_PS3=1 \
+    -DAPI_RSX=1 \
+    -DEDITOR=0 \
+    -DLUA_ENABLED=1 \
+    -DGLM_FORCE_RADIANS \
+    -DGLM_FORCE_UNRESTRICTED_GENTYPE \
+    -DLOGGING_ENABLED=1 \
+    -DPOLYPHASE_ADDON_INT32_IS_INT=1 \
+    $(ADDON_DEFINES)
+
+# On PS3, powerpc64-ps3-elf makes int32_t == `int`, so the engine's addon-only
+# Datum(int) overload collides with Datum(int32_t). POLYPHASE_ADDON_INT32_IS_INT
+# (above) opts the engine out of that extra overload for this platform.
+
+# INCLUDE combines our engine/addon include dirs with PSL1GHT's own (the
+# LIBPSL1GHT_INC var is defined by ppu_rules, included below; recursive `=`
+# defers its expansion until after the include).
+INCLUDE  = $(addprefix -I,$(INCDIRS)) $(LIBPSL1GHT_INC)
+
+# Force-include the PS3 toolchain compat shim (pulls C99 math into std:: for
+# glm — see compat/ps3_toolchain_compat.h). Must precede every other include.
+FORCE_INC = -include $(ADDON_PS3_RUNTIME)/compat/ps3_toolchain_compat.h
+
+# MACHDEP is defined by ppu_rules (-mhard-float -fmodulo-sched -ffunction-sections
+# -fdata-sections). Recursive `=` so it resolves after the include.
+# ps3dev's libstdc++ (GCC 7.2) ships with C99 stdio/stdlib DISABLED
+# (_GLIBCXX11_USE_C99_STDIO / _STDLIB are #undef in its c++config.h), so
+# std::snprintf / std::vsnprintf / std::to_string / std::stoi / std::strtoll
+# etc. are NOT pulled into namespace std — which the engine uses widely. The
+# c++config gates are #ifndef-guarded, so defining them here wins, and newlib
+# provides every function the <cstdio>/<cstdlib> C99 blocks reference (no
+# long-double gap like the math TR1 case that needs the compat shim instead).
+STDCXX_C99 = -D_GLIBCXX_USE_C99_STDIO=1 -D_GLIBCXX_USE_C99_STDLIB=1
+
+CFLAGS   = $(MACHDEP) -O2 -Wall -Wno-unused-parameter -Wno-unused-variable \
+           $(STDCXX_C99) $(FORCE_INC) $(INCLUDE) $(DEFINES)
+CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=gnu++17
+ASFLAGS  = $(MACHDEP) $(INCLUDE) $(DEFINES)
+
+# ---- Libraries --------------------------------------------------------------
+# PSL1GHT ships the PS3 system libs the runtime backend links against. lv2 (the
+# kernel syscall lib) must stay near the end; MIPS-style left-to-right symbol
+# resolution applies. Unused libs are harmless — the linker drops them.
+LIBPATHS = $(LIBPSL1GHT_LIB) $(addprefix -L,$(ADDON_LIBDIR))
+LIBS = \
+    -lrsx -lgcm_sys \
+    -lsysutil -lsysmodule \
+    -lio -laudio \
+    -lnet -lnetctl -lsysfs \
+    -llv2 -lm \
+    $(ADDON_LIBS)
+
+# --gc-sections pairs with -ffunction-sections/-fdata-sections in MACHDEP to
+# drop unreferenced code. --allow-multiple-definition mirrors the PSP build's
+# newlib-vs-syscall duplicate-symbol workaround.
+LDFLAGS = $(MACHDEP) -Wl,--gc-sections -Wl,--allow-multiple-definition
+
+# ---- PSL1GHT rules ----------------------------------------------------------
+# ppu_rules sets PREFIX:=ppu-, MACHDEP, the tool vars (STRIP, SPRX, FSELF,
+# SELF_NPDRM, SFO, PKG, PACKAGE_FINALIZE), LIBPSL1GHT_INC/LIB, exports PATH, and
+# includes base_rules (compile rules + `%.elf: $(OFILES)` link) + data_rules.
+# TARGET is already set above, so ppu_rules' `TARGET ?=` won't override it.
+include $(PSL1GHT)/ppu_rules
+
+# Force the linker to the PPU *C++* driver (ppu-g++). Two reasons:
+#  1. base_rules does `LD ?= $(PREFIX)gcc`, but GNU make ships a BUILT-IN default
+#     `LD = ld` (origin 'default') and `?=` only assigns when a var is truly
+#     *undefined* — a 'default'-origin value counts as defined, so the `?=` is a
+#     no-op and LD stays as the host `ld`, which dies on `-mhard-float` with
+#     "unrecognised emulation mode".
+#  2. The engine is C++; linking with the C driver (ppu-gcc) leaves every
+#     libstdc++/libsupc++ symbol undefined (operator new/delete, __cxa_guard_*,
+#     std::__throw_*, iostreams, ...). ppu-g++ pulls in libstdc++/libsupc++ in
+#     the correct order automatically.
+override LD := ppu-g++
+
+# Header deps written by base_rules (-MF $(DEPSDIR)/$*.d). Non-fatal include.
+-include $(CPPFILES:.cpp=.d) $(CFILES:.c=.d)
+
+# ---- Link + sign + stage ----------------------------------------------------
+# base_rules provides `%.elf: $(OFILES)`. We add: strip + sprxlinker (fix up
+# PRX imports/exports) → the elf that make_self_npdrm / fself consume, then
+# fself → a directly-bootable fake-signed .self (RPCS3 / HEN / CFW).
+#
+# The staged .elf is the STRIPPED + SPRXLINKED one — that is the exact input
+# the addon's PostPackage feeds to make_self_npdrm for the EBOOT.BIN / .pkg.
+BUILD_PS3 := $(PROJECT_ROOT)/Build/PS3
+
+$(TARGET).sprx.elf: $(TARGET).elf
+	$(VERB) echo "strip + sprxlinker ... $(notdir $@)"
+	$(VERB) $(STRIP) $< -o $@
+	$(VERB) $(SPRX) $@
+
+$(TARGET).self: $(TARGET).sprx.elf
+	$(VERB) echo "fself ... $(notdir $@)"
+	$(VERB) $(FSELF) $< $@
+
+all: stage
+stage: $(TARGET).self
+	@mkdir -p $(BUILD_PS3)
+	@cp $(TARGET).self $(BUILD_PS3)/$(TARGET).self
+	@cp $(TARGET).sprx.elf $(BUILD_PS3)/$(TARGET).elf
+	@echo "Staged $(BUILD_PS3)/$(TARGET).self (+ $(TARGET).elf for pkg)"
+
+cleanstage:
+	@rm -rf $(BUILD_PS3)
+
+.PHONY: all stage cleanstage

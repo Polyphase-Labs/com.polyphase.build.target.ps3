@@ -1,0 +1,22 @@
+{
+    "name": "com.polyphase.build.target.ps3",
+    "author": "Justin Jaro",
+    "description": "Adds a 'Sony PS3 (PSL1GHT)' build target to the Polyphase editor. Cross-compiles the engine for the Cell/PPU via the ps3dev/PSL1GHT toolchain (ppu-gcc), links a .elf, fake-signs it into a directly-bootable .self, and wraps it into an installable .pkg (make_self_npdrm + sfo + pkg + package_finalize). Launches in RPCS3 or deploys to a dev console via ps3load. On Linux/macOS the toolchain runs natively against $PS3DEV; on Windows it runs inside WSL2 (PSL1GHT publishes no native Windows binaries) — install WSL2 + Ubuntu, then install ps3dev inside WSL.",
+    "version": "1.0.0",
+    "native": {
+        "target": "editor",
+        "sourceDir": "Source",
+        "binaryName": "com.polyphase.build.target.ps3",
+        "entrySymbol": "PolyphasePlugin_GetDesc",
+        "apiVersion": 4,
+        "resolveMode": "source",
+        "buildTargets": [
+            {
+                "id": "homebrew.ps3",
+                "displayName": "Sony PS3 (PSL1GHT)",
+                "category": "Retro Consoles"
+            }
+        ],
+        "binaries": []
+    }
+}
