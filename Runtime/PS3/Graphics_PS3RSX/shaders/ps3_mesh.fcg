@@ -1,0 +1,25 @@
+// PS3/RSX mesh fragment program — single directional light + ambient, folded
+// with the material colour and the bound texture. Unlit materials pass
+// ambient=1 / lightColor=0 from the backend so the texture*matColor shows
+// flat. Enough shading to give 3D geometry visible form; richer material /
+// multi-light support is a later phase.
+void main
+(
+	float2 texcoord : TEXCOORD0,
+	float3 normal   : TEXCOORD1,
+
+	uniform sampler2D texture,
+	uniform float4    matColor,
+	uniform float3    lightDir,     // normalized, world space, points FROM light
+	uniform float3    lightColor,
+	uniform float3    ambient,
+
+	out float4 oColor
+)
+{
+	float3 N = normalize(normal);
+	float  ndl = max(dot(N, -lightDir), 0.0f);
+	float3 lighting = ambient + lightColor * ndl;
+	float4 tex = tex2D(texture, texcoord);
+	oColor = tex * matColor * float4(lighting, 1.0f);
+}

@@ -108,17 +108,12 @@ std::string SYS_GetExecutablePath()
 
 std::string SYS_GetPolyphasePath()
 {
-    // Asset root. A packaged pkg lays assets under USRDIR alongside EBOOT.BIN.
-    static std::string sBase;
-    if (sBase.empty())
-    {
-        sysFSStat st;
-        if (sysFsStat("/dev_bdvd/PS3_GAME/USRDIR", &st) == 0)
-            sBase = "/dev_bdvd/PS3_GAME/USRDIR/";
-        else
-            sBase = "/dev_hdd0/game/" POLYPHASE_PS3_GAME_DIR "/USRDIR/";
-    }
-    return sBase;
+    // Asset root — the game's USRDIR (assets are staged alongside EBOOT.BIN).
+    // Constructed fresh each call: a function-local `static std::string` was
+    // removed because it was implicated in a stack-sensitive corruption in the
+    // config-load path under RPCS3. Disc (/dev_bdvd) support can be re-added
+    // without a mutable static if needed.
+    return std::string("/dev_hdd0/game/" POLYPHASE_PS3_GAME_DIR "/USRDIR/");
 }
 
 std::string SYS_GetCurrentDirectoryPath()
@@ -141,11 +136,51 @@ void SYS_SetWorkingDirectory(const std::string& /*dirPath*/) {}
 // File I/O
 // =========================================================================
 
+// lv2 sysFs requires ABSOLUTE paths, but the engine hands the file layer paths
+// relative to the asset root (e.g. "Engine/Assets/T_X.oct",
+// "BuildTarget-PS3/AssetRegistry.txt") — there is no per-process CWD on PS3 to
+// anchor them. Resolve any relative path against SYS_GetPolyphasePath() (the
+// game's USRDIR, where the cooked assets are staged), so homebrew-style disk
+// asset loading works. Already-absolute paths (/dev_hdd0/..., /dev_bdvd/...)
+// pass through untouched.
+static std::string Ps3ResolvePath(const char* path)
+{
+    if (path == nullptr) return std::string();
+    if (path[0] == '/') return std::string(path);
+    std::string result = SYS_GetPolyphasePath();
+    result += path;
+    return result;
+}
+
+// Compiled at -O0: at -O2 the ppu GCC 7.2 codegen for this function produced a
+// stack-sensitive wild write into read-only memory under RPCS3 (crash on the
+// first real file-existence probe). -O0 sidesteps the miscompilation; the
+// function is cold (called during asset discovery, not per-frame).
+__attribute__((optimize("O0")))
 bool SYS_DoesFileExist(const char* path, bool /*isAsset*/)
 {
     if (path == nullptr) return false;
-    sysFSStat st;
-    return sysFsStat(path, &st) == 0;
+    const std::string abs = Ps3ResolvePath(path);
+
+    // NOTE: do NOT use sysFsStat here. Its stat struct is `__attribute__((packed))`
+    // and lands unaligned on the stack; under RPCS3 the lv2 stat syscall's write
+    // into that buffer faults on the first *successful* stat (a missing path fails
+    // before the write, which is why SYS_GetPolyphasePath's probe never tripped
+    // it). Probe existence with the open path instead — the same sysFsOpen /
+    // sysFsOpendir calls the rest of this file uses reliably.
+    s32 fd = -1;
+    if (sysFsOpen(abs.c_str(), SYS_O_RDONLY, &fd, NULL, 0) == 0 && fd >= 0)
+    {
+        sysFsClose(fd);
+        return true;
+    }
+    s32 dfd = -1;
+    if (sysFsOpendir(abs.c_str(), &dfd) == 0 && dfd >= 0)
+    {
+        sysFsClosedir(dfd);
+        return true;
+    }
+    return false;
 }
 
 void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
@@ -155,10 +190,12 @@ void SYS_AcquireFileData(const char* path, bool /*isAsset*/, int32_t maxSize,
     outSize = 0;
     if (path == nullptr) return;
 
+    const std::string abs = Ps3ResolvePath(path);
+
     s32 fd = -1;
-    if (sysFsOpen(path, SYS_O_RDONLY, &fd, NULL, 0) != 0 || fd < 0)
+    if (sysFsOpen(abs.c_str(), SYS_O_RDONLY, &fd, NULL, 0) != 0 || fd < 0)
     {
-        LogWarning("SYS_AcquireFileData: sysFsOpen failed for '%s'", path);
+        LogWarning("SYS_AcquireFileData: sysFsOpen failed for '%s'", abs.c_str());
         return;
     }
 
@@ -200,19 +237,22 @@ void SYS_ReleaseFileData(char* data)
 bool SYS_CreateDirectory(const char* dirPath)
 {
     if (dirPath == nullptr) return false;
-    return sysFsMkdir(dirPath, 0777) == 0;
+    const std::string abs = Ps3ResolvePath(dirPath);
+    return sysFsMkdir(abs.c_str(), 0777) == 0;
 }
 
 void SYS_RemoveDirectory(const char* dirPath)
 {
     if (dirPath == nullptr) return;
-    sysFsRmdir(dirPath);
+    const std::string abs = Ps3ResolvePath(dirPath);
+    sysFsRmdir(abs.c_str());
 }
 
 void SYS_OpenDirectory(const std::string& dirPath, DirEntry& outDirEntry)
 {
     outDirEntry.mValid = false;
-    if (sysFsOpendir(dirPath.c_str(), &outDirEntry.mDirFd) != 0 || outDirEntry.mDirFd < 0)
+    const std::string abs = Ps3ResolvePath(dirPath.c_str());
+    if (sysFsOpendir(abs.c_str(), &outDirEntry.mDirFd) != 0 || outDirEntry.mDirFd < 0)
     {
         outDirEntry.mDirFd = -1;
         return;

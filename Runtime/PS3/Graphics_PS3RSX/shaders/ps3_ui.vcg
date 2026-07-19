@@ -1,0 +1,22 @@
+// PS3/RSX UI vertex program — 2D screen-space widgets (Quad / Text / Poly).
+// Positions arrive in screen pixels; an orthographic matrix (built by the
+// backend, top-left origin) maps them to clip space. Colour is passed through
+// as a 4-float attribute (the backend unpacks VertexUI's uint32 RGBA into
+// floats so there is no endianness ambiguity on the big-endian PPU).
+void main
+(
+	float2 position : POSITION,
+	float2 texcoord : TEXCOORD0,
+	float4 color    : COLOR0,
+
+	uniform float4x4 orthoMatrix,
+
+	out float4 ePosition : POSITION,
+	out float2 oTexcoord : TEXCOORD0,
+	out float4 oColor    : TEXCOORD1
+)
+{
+	ePosition = mul(orthoMatrix, float4(position, 0.0f, 1.0f));
+	oTexcoord = texcoord;
+	oColor    = color;
+}

@@ -251,7 +251,23 @@ FORCE_INC = -include $(ADDON_PS3_RUNTIME)/compat/ps3_toolchain_compat.h
 # long-double gap like the math TR1 case that needs the compat shim instead).
 STDCXX_C99 = -D_GLIBCXX_USE_C99_STDIO=1 -D_GLIBCXX_USE_C99_STDLIB=1
 
-CFLAGS   = $(MACHDEP) -O2 -Wall -Wno-unused-parameter -Wno-unused-variable \
+# Codegen safety: ppu GCC 7.2 -O2 miscompiles some of the engine's std::string /
+# low-level memory code, producing stack-sensitive wild writes into read-only
+# memory (observed: SYS_DoesFileExist, UILoader error path — both wrote a bad
+# pointer over rodata under RPCS3). MACHDEP turns on -fmodulo-sched (software
+# pipelining, historically buggy in this GCC), and -O2 enables strict aliasing.
+# Both are common miscompilation sources for hand-written low-level C++; disable
+# them globally (later flags win over MACHDEP's -fmodulo-sched). -fno-strict-
+# aliasing is also simply correct for the engine's pervasive memcpy/byte-punning.
+# Use -O1, not -O2: ppu GCC 7.2's aggressive -O2 pass tier (software pipelining,
+# tree vectorization, aggressive scheduling/GCSE) miscompiles some of the
+# engine's std::string / low-level code into stack-sensitive wild writes into
+# read-only memory under RPCS3 (seen in SYS_DoesFileExist and the UILoader
+# include path, where an uninitialized/poison pointer got used). -O1 keeps
+# reasonable size/speed while disabling that whole tier. Also drop strict
+# aliasing (correct for the engine's memcpy/byte-punning) and modulo-sched.
+CODEGEN_SAFE = -fno-modulo-sched -fno-strict-aliasing
+CFLAGS   = $(MACHDEP) -O1 $(CODEGEN_SAFE) -Wall -Wno-unused-parameter -Wno-unused-variable \
            $(STDCXX_C99) $(FORCE_INC) $(INCLUDE) $(DEFINES)
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=gnu++17
 ASFLAGS  = $(MACHDEP) $(INCLUDE) $(DEFINES)

@@ -1,0 +1,17 @@
+// PS3/RSX UI fragment program — modulate the bound texture by the per-vertex
+// colour (which already carries the widget's uniform tint, folded in by the
+// backend). Untextured widgets (borders, solid fills) bind a 1x1 white texel
+// so the multiply is a no-op and the vertex colour shows through.
+void main
+(
+	float2 texcoord : TEXCOORD0,
+	float4 color    : TEXCOORD1,
+
+	uniform sampler2D texture,
+	uniform float4    tint,       // widget uniform colour, set per-draw
+
+	out float4 oColor
+)
+{
+	oColor = tex2D(texture, texcoord) * color * tint;
+}
