@@ -67,7 +67,13 @@ namespace
 {
     // ---- RSX / video state (Phase 1) ------------------------------------
     constexpr u32 kCommandBufferSize = 0x80000;         // 512 KB
-    constexpr u32 kHostSize          = 16 * 1024 * 1024;
+    // RSX memory pool: rsxMemalign (framebuffers, depth, ALL vertex/index/
+    // texture buffers) allocates from this rsxInit host region. Framebuffers +
+    // depth already take ~10 MB at 720p; a real scene's meshes + textures (e.g.
+    // a 2 MB texture atlas) blow past a 16 MB pool, so rsxMemalign starts
+    // returning null/garbage and the resulting bad RSX commands hard-crash
+    // RPCS3. The PSL1GHT rsxtest sample sizes this at 128 MB — match it.
+    constexpr u32 kHostSize          = 128 * 1024 * 1024;
     constexpr u8  kLabelIndex        = 255;
 
     gcmContextData* gCtx        = nullptr;
@@ -87,6 +93,19 @@ namespace
     u32   gLabelVal       = 1;
 
     bool  gInitialized = false;
+
+    // TEMP bisection toggles: isolate whether the ~1s scene-render crash is in
+    // my draw code (RSX) or in game-side Lua logic. false = that draw type is a
+    // no-op (clear+flip still run). Flip back to true once diagnosed.
+    // Real rendering re-enabled after the GetColor()/glm::vec4-return codegen
+    // fault was fixed by reordering GetTexture before GetColor in GFX_DrawQuad.
+    bool  gDrawMeshEnabled = true;
+    bool  gDrawUIEnabled   = true;
+    bool  gUiSkipDraw      = false;
+    bool  gUiSkipPrograms  = false;
+    bool  gUiDoPipeline    = true;    // SetupUIPipeline (blend/depth state)
+    bool  gUiDoTexture     = true;    // BindTextureUnit
+    bool  gUiDoAttribs     = true;    // BindUIAttribs (16-reset + 3 binds)
 
     // ---- Shader programs (Phase 2) --------------------------------------
     rsxVertexProgram*   gUiVp        = nullptr;
@@ -436,6 +455,19 @@ namespace
         return glm::ortho(0.0f, w, h, 0.0f, -1.0f, 1.0f);
     }
 
+    // Expand a widget's 2D affine transform (glm::mat3: rotate-around-pivot +
+    // translation) into a 4x4 model matrix for the UI vertex shader. Identity
+    // when the widget has no rotation.
+    glm::mat4 WidgetModel(Widget* w)
+    {
+        const glm::mat3& t = w->GetTransform();
+        glm::mat4 m(1.0f);
+        m[0][0] = t[0][0]; m[0][1] = t[0][1];
+        m[1][0] = t[1][0]; m[1][1] = t[1][1];
+        m[3][0] = t[2][0]; m[3][1] = t[2][1];
+        return m;
+    }
+
     void RepackUI(const VertexUI* src, uint32_t n, RsxUIVertex* dst)
     {
         for (uint32_t i = 0; i < n; ++i)
@@ -454,6 +486,14 @@ namespace
 
     void BindUIAttribs(const RsxUIVertex* buf)
     {
+        // Defensively disable every vertex attribute array first. A prior mesh
+        // draw leaves NORMAL(2) enabled into the small mesh buffer; any other
+        // stale array would likewise be fetched OOB by rsxDrawVertexArray for
+        // all n UI verts → RSX GPU fault (hard-crashes RPCS3). size/stride 0 =
+        // attribute off. We then enable only POS/TEX0/COLOR0 below.
+        for (u8 a = 0; a < 16; ++a)
+            rsxBindVertexArrayAttrib(gCtx, a, 0, 0, 0, 0, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
+
         u32 off;
         rsxAddressToOffset((void*)&buf[0].x, &off);
         rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_POS, 0, off, sizeof(RsxUIVertex), 2, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
@@ -461,23 +501,55 @@ namespace
         rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_TEX0, 0, off, sizeof(RsxUIVertex), 2, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
         rsxAddressToOffset((void*)&buf[0].r, &off);
         rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_COLOR0, 0, off, sizeof(RsxUIVertex), 4, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
+        // A prior mesh draw leaves NORMAL(attr 2) enabled, pointing into the
+        // (small) mesh vertex buffer. rsxDrawVertexArray fetches every enabled
+        // attribute for all n vertices regardless of what the UI vertex program
+        // reads, so the stale NORMAL is read OOB past the mesh buffer → RSX GPU
+        // fault (hard-crashes RPCS3). Disable it (size/stride 0 = attribute off).
+        rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_NORMAL, 0, 0, 0, 0, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
     }
 
-    // Common UI draw: bind program + ortho + tint + texture + attribs, then draw.
-    void DrawUI(const RsxUIVertex* buf, uint32_t n, u32 prim, const glm::vec4& tint, Texture* tex)
+    // Common UI draw: bind program + ortho*model + tint + texture + attribs.
+    // The model matrix carries the widget's rotation/position so the shared
+    // vertex buffer is NEVER mutated per-draw (RSX reads it asynchronously, so
+    // an in-place transform + undo would be read AFTER the undo → wrong pos).
+    void DrawUI(const RsxUIVertex* buf, uint32_t n, u32 prim, const glm::vec4& tint, Texture* tex,
+                const glm::mat4& model = glm::mat4(1.0f))
     {
+        if (!gDrawUIEnabled) return;
+        static int sUIDbg = 0;
+        if (sUIDbg < 30 && buf != nullptr && n > 0)
+        {
+            char b[192];
+            snprintf(b, sizeof(b), "[CK] DrawUI BUILD=20-layout n=%u prim=%u v0=(%.1f,%.1f) v0col=(%.2f,%.2f,%.2f,%.2f) tint=(%.2f,%.2f,%.2f,%.2f) tex=%s ortho=%.0fx%.0f\n",
+                     (unsigned)n, (unsigned)prim, buf[0].x, buf[0].y, buf[0].r, buf[0].g, buf[0].b, buf[0].a,
+                     tint.r, tint.g, tint.b, tint.a, tex ? "Y" : "N",
+                     Renderer::Get() ? (double)Renderer::Get()->GetViewportWidth() : 0.0,
+                     Renderer::Get() ? (double)Renderer::Get()->GetViewportHeight() : 0.0);
+            fputs(b, stdout); fflush(stdout); ++sUIDbg;
+        }
         if (buf == nullptr || n == 0) return;
-        SetupUIPipeline();
 
-        rsxLoadVertexProgram(gCtx, gUiVp, gUiVpUcode);
-        SetVertexMatrix(gUiVp, gUiOrtho, UIOrtho());
+        if (gUiDoPipeline)
+            SetupUIPipeline();
 
-        SetFragmentVec4(gUiFp, gUiTint, gUiFpOffset, tint);
-        BindTextureUnit(tex, gUiTexUnit ? (u8)gUiTexUnit->index : 0);
-        rsxLoadFragmentProgramLocation(gCtx, gUiFp, gUiFpOffset, GCM_LOCATION_RSX);
+        if (!gUiSkipPrograms)
+        {
+            rsxLoadVertexProgram(gCtx, gUiVp, gUiVpUcode);
+            SetVertexMatrix(gUiVp, gUiOrtho, UIOrtho() * model);
+        }
 
-        BindUIAttribs(buf);
-        rsxDrawVertexArray(gCtx, prim, 0, n);
+        if (!gUiSkipPrograms)
+            SetFragmentVec4(gUiFp, gUiTint, gUiFpOffset, tint);
+        if (gUiDoTexture)
+            BindTextureUnit(tex, gUiTexUnit ? (u8)gUiTexUnit->index : 0);
+        if (!gUiSkipPrograms)
+            rsxLoadFragmentProgramLocation(gCtx, gUiFp, gUiFpOffset, GCM_LOCATION_RSX);
+
+        if (gUiDoAttribs)
+            BindUIAttribs(buf);
+        if (!gUiSkipDraw)
+            rsxDrawVertexArray(gCtx, prim, 0, n);
     }
 
     // Allocate/grow an RSX-mapped UI vertex buffer to hold `bytes`.
@@ -609,6 +681,7 @@ bool GFX_ShouldCullLights() { return true; }
 
 void GFX_BeginRenderPass(RenderPassId renderPassId)
 {
+    { static int d=0; if(d<20){ char b[64]; snprintf(b,sizeof(b),"[CK] BeginRenderPass id=%d\n",(int)renderPassId); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     if (renderPassId == RenderPassId::Forward)
     {
@@ -625,6 +698,7 @@ void GFX_EndRenderPass() {}
 
 void GFX_SetPipelineState(PipelineConfig config)
 {
+    { static int d=0; if(d<20){ char b[64]; snprintf(b,sizeof(b),"[CK] SetPipeline cfg=%d\n",(int)config); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     switch (config)
     {
@@ -651,15 +725,18 @@ void GFX_SetPipelineState(PipelineConfig config)
 
 void GFX_SetViewport(int32_t x, int32_t y, int32_t w, int32_t h, bool /*handlePrerotation*/)
 {
+    { static int d=0; if(d<20){ char b[96]; snprintf(b,sizeof(b),"[CK] SetViewport x=%d y=%d w=%d h=%d\n",x,y,w,h); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     SetViewportRSX(x, y, w, h);
 }
 void GFX_SetScissor(int32_t x, int32_t y, int32_t w, int32_t h, bool /*handlePrerotation*/)
 {
+    { static int d=0; if(d<20){ char b[96]; snprintf(b,sizeof(b),"[CK] SetScissor x=%d y=%d w=%d h=%d\n",x,y,w,h); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     if (w <= 0 || h <= 0) { x = 0; y = 0; w = (int32_t)gDisplayWidth; h = (int32_t)gDisplayHeight; }
     rsxSetScissor(gCtx, (u16)glm::max(0, x), (u16)glm::max(0, y),
                   (u16)glm::min((int32_t)gDisplayWidth, w), (u16)glm::min((int32_t)gDisplayHeight, h));
+    { static int d=0; if(d<20){ fputs("[CK] SetScissor OK\n",stdout); fflush(stdout); ++d; } }
 }
 
 glm::mat4 GFX_MakePerspectiveMatrix(float fovyDegrees, float aspectRatio, float zNear, float zFar)
@@ -705,6 +782,20 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& /*data*/)
 
     const std::vector<uint8_t>& pixels = texture->GetPixels();
     if (pixels.empty()) return;
+
+    // This backend only understands 32-bit RGBA8 (4 bytes/texel). If the cooked
+    // pixel buffer is smaller than srcW*srcH*4 the texture is a different format
+    // (RGB565 / compressed / etc.); reading it as RGBA8 would run off the end of
+    // the vector and crash. Skip it (the sampler falls back to the white texel)
+    // rather than fault. Real format support is a later phase.
+    const size_t rgba8Bytes = (size_t)srcW * (size_t)srcH * 4u;
+    { char b[160]; snprintf(b, sizeof(b), "[CK] GFX_CreateTex %ux%u pixels=%u need=%u fmt=%d\n", (unsigned)srcW, (unsigned)srcH, (unsigned)pixels.size(), (unsigned)rgba8Bytes, (int)texture->GetFormat()); fputs(b, stdout); fflush(stdout); }
+    if (pixels.size() < rgba8Bytes)
+    {
+        LogWarning("[GFX] texture '%s' is not RGBA8 (%u px bytes, need %u) — skipping (white fallback)",
+                   texture->GetName().c_str(), (unsigned)pixels.size(), (unsigned)rgba8Bytes);
+        return;
+    }
 
     // Linear RSX textures need a pitch that is a multiple of 64 bytes → pad the
     // width up to a multiple of 16 texels. Height is unconstrained.
@@ -832,6 +923,7 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
 
 void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
 {
+    if (!gDrawMeshEnabled) return;
     if (!gInitialized || comp == nullptr) return;
 
     StaticMesh* mesh = meshOverride ? meshOverride : comp->GetStaticMesh();
@@ -878,6 +970,9 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
     rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_TEX0,   0, off, stride, 2, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
     rsxAddressToOffset((void*)(vbuf + 28), &off);
     rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_NORMAL, 0, off, stride, 3, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
+    // Symmetric to BindUIAttribs: disable COLOR0(attr 3) that a prior UI draw
+    // leaves enabled, else it is fetched OOB from the stale UI buffer here.
+    rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_COLOR0, 0, 0, 0, 0, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
 
     u32 ioff;
     rsxAddressToOffset(r->mIndexData, &ioff);
@@ -893,7 +988,9 @@ void GFX_CreateQuadResource(Quad* quad)
     if (quad == nullptr) return;
     QuadResource* r = quad->GetResource();
     if (r == nullptr) return;
+    { char b[128]; snprintf(b, sizeof(b), "[CK] GFX_CreateQuadResource r=%p mVertexData=%p cap=%u\n", (void*)r, r->mVertexData, (unsigned)r->mVertexCapacity); fputs(b, stdout); fflush(stdout); }
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, Quad::kMaxQuadVertices * sizeof(RsxUIVertex));
+    { fputs("[CK] GFX_CreateQuadResource done\n", stdout); fflush(stdout); }
 }
 void GFX_DestroyQuadResource(Quad* quad)
 {
@@ -905,6 +1002,7 @@ void GFX_DestroyQuadResource(Quad* quad)
 }
 void GFX_UpdateQuadResourceVertexData(Quad* quad)
 {
+    { static int d=0; if(d<6){ char b[96]; snprintf(b,sizeof(b),"[CK] enter UpdQuad quad=%p n=%u\n",(void*)quad, quad?(unsigned)quad->GetNumVertices():0u); fputs(b,stdout); fflush(stdout); ++d; } }
     if (quad == nullptr) return;
     QuadResource* r = quad->GetResource();
     if (r == nullptr) return;
@@ -919,8 +1017,14 @@ void GFX_DrawQuad(Quad* quad)
     if (!gInitialized || quad == nullptr) return;
     QuadResource* r = quad->GetResource();
     if (r == nullptr || r->mVertexData == nullptr) return;
-    DrawUI((const RsxUIVertex*)r->mVertexData, quad->GetNumVertices(), GCM_TYPE_TRIANGLE_FAN,
-           quad->GetColor(), quad->GetTexture());
+    // Quad vertices are already at screen position (mRect); WidgetModel adds the
+    // rotate-around-pivot. GetColor() (glm::vec4 return) MUST be the last quad->
+    // call to avoid the ppu-gcc codegen fault (see memory note).
+    Texture* tex = quad->GetTexture();
+    const uint32_t nv = quad->GetNumVertices();
+    const glm::mat4 model = WidgetModel(quad);
+    const glm::vec4 col = quad->GetColor();
+    DrawUI((const RsxUIVertex*)r->mVertexData, nv, GCM_TYPE_TRIANGLE_FAN, col, tex, model);
 }
 
 void GFX_CreateQuadBorderResource(Quad* quad)
@@ -954,8 +1058,10 @@ void GFX_DrawQuadBorder(Quad* quad)
     if (!gInitialized || quad == nullptr) return;
     QuadResource* r = quad->GetBorderResource();
     if (r == nullptr || r->mVertexData == nullptr) return;
-    DrawUI((const RsxUIVertex*)r->mVertexData, quad->GetBorderNumVertices(), GCM_TYPE_TRIANGLE_FAN,
-           quad->GetBorderColor(), nullptr);
+    const uint32_t nv = quad->GetBorderNumVertices();
+    const glm::mat4 model = WidgetModel(quad);
+    const glm::vec4 col = quad->GetBorderColor();
+    DrawUI((const RsxUIVertex*)r->mVertexData, nv, GCM_TYPE_TRIANGLE_FAN, col, nullptr, model);
 }
 
 void GFX_CreateTextResource(Text* /*text*/) {}
@@ -970,6 +1076,7 @@ void GFX_DestroyTextResource(Text* text)
 }
 void GFX_UpdateTextResourceVertexData(Text* text)
 {
+    { static int d=0; if(d<8){ fputs("[CK] enter UpdText\n",stdout); fflush(stdout); ++d; } }
     if (text == nullptr) return;
     TextResource* r = text->GetResource();
     if (r == nullptr) return;
@@ -990,6 +1097,7 @@ void GFX_UpdateTextResourceVertexData(Text* text)
 }
 void GFX_DrawText(Text* text)
 {
+    { static int d=0; if(d<8){ fputs("[CK] enter DrawText\n",stdout); fflush(stdout); ++d; } }
     if (!gInitialized || text == nullptr) return;
     TextResource* r = text->GetResource();
     if (r == nullptr || r->mVertexData == nullptr) return;
@@ -1012,22 +1120,18 @@ void GFX_DrawText(Text* text)
     const float ox = rect.mX + justified.x;
     const float oy = rect.mY + justified.y;
 
-    RsxUIVertex* buf = (RsxUIVertex*)r->mVertexData;
-    for (uint32_t i = 0; i < numVerts; ++i)
-    {
-        buf[i].x = buf[i].x * scale + ox;
-        buf[i].y = buf[i].y * scale + oy;
-    }
+    // Text vertices stay widget-local (font-native size). Position/scale/rotate
+    // them via the model matrix — the vertex buffer is NOT mutated, so the
+    // asynchronous RSX draw reads the correct data. Order: rotate-around-pivot
+    // (WidgetModel) * translate to the widget rect * scale to the text size.
+    const glm::mat4 model = WidgetModel(text)
+        * glm::translate(glm::mat4(1.0f), glm::vec3(ox, oy, 0.0f))
+        * glm::scale(glm::mat4(1.0f), glm::vec3(scale, scale, 1.0f));
 
-    DrawUI(buf, numVerts, GCM_TYPE_TRIANGLES, text->GetColor(), fontTex);
-
-    // Undo the in-place transform so the next frame re-bakes from the raw
-    // (widget-local) verts written by UpdateTextResourceVertexData.
-    for (uint32_t i = 0; i < numVerts; ++i)
-    {
-        buf[i].x = (buf[i].x - ox) / scale;
-        buf[i].y = (buf[i].y - oy) / scale;
-    }
+    // GetColor() returns glm::vec4 by value — keep it LAST (after every other
+    // text-> call) to avoid the ppu-gcc codegen fault. See memory note.
+    const glm::vec4 color = text->GetColor();
+    DrawUI((const RsxUIVertex*)r->mVertexData, numVerts, GCM_TYPE_TRIANGLES, color, fontTex, model);
 }
 
 void GFX_CreatePolyResource(Poly* /*poly*/) {}
@@ -1055,8 +1159,10 @@ void GFX_DrawPoly(Poly* poly)
     if (!gInitialized || poly == nullptr) return;
     PolyResource* r = poly->GetResource();
     if (r == nullptr || r->mVertexData == nullptr) return;
-    DrawUI((const RsxUIVertex*)r->mVertexData, poly->GetNumVertices(), GCM_TYPE_LINE_STRIP,
-           poly->GetColor(), nullptr);
+    const uint32_t nv = poly->GetNumVertices();
+    const glm::mat4 model = WidgetModel(poly);
+    const glm::vec4 col = poly->GetColor();
+    DrawUI((const RsxUIVertex*)r->mVertexData, nv, GCM_TYPE_LINE_STRIP, col, nullptr, model);
 }
 
 // =========================================================================

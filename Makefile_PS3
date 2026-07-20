@@ -267,7 +267,12 @@ STDCXX_C99 = -D_GLIBCXX_USE_C99_STDIO=1 -D_GLIBCXX_USE_C99_STDLIB=1
 # reasonable size/speed while disabling that whole tier. Also drop strict
 # aliasing (correct for the engine's memcpy/byte-punning) and modulo-sched.
 CODEGEN_SAFE = -fno-modulo-sched -fno-strict-aliasing
-CFLAGS   = $(MACHDEP) -O1 $(CODEGEN_SAFE) -Wall -Wno-unused-parameter -Wno-unused-variable \
+# -O0 confirmed the scene-load crash is NOT optimizer miscompilation (it's a
+# real uninitialized-read / logic bug that RPCS3 exposes via 0xABADCAFE memory
+# poisoning), so back to -O1 for size/speed. -DNDEBUG makes this a proper
+# release build: OCT_ASSERT becomes a no-op (a shipped console build must not
+# call SYS_Assert on a failed assertion), matching the other console targets.
+CFLAGS   = $(MACHDEP) -O1 $(CODEGEN_SAFE) -DNDEBUG -Wall -Wno-unused-parameter -Wno-unused-variable \
            $(STDCXX_C99) $(FORCE_INC) $(INCLUDE) $(DEFINES)
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti -std=gnu++17
 ASFLAGS  = $(MACHDEP) $(INCLUDE) $(DEFINES)
@@ -288,7 +293,7 @@ LIBS = \
 # --gc-sections pairs with -ffunction-sections/-fdata-sections in MACHDEP to
 # drop unreferenced code. --allow-multiple-definition mirrors the PSP build's
 # newlib-vs-syscall duplicate-symbol workaround.
-LDFLAGS = $(MACHDEP) -Wl,--gc-sections -Wl,--allow-multiple-definition
+LDFLAGS = $(MACHDEP) -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--wrap=malloc
 
 # ---- PSL1GHT rules ----------------------------------------------------------
 # ppu_rules sets PREFIX:=ppu-, MACHDEP, the tool vars (STRIP, SPRX, FSELF,

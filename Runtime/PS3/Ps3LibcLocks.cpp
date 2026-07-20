@@ -49,4 +49,57 @@ void __sfp_lock_release(void) {}
 
 }
 
+// -------------------------------------------------------------------------
+// Zero-initializing malloc (console-port UB mitigation).
+//
+// The engine has latent uninitialized-variable reads that are benign on the
+// desktop — where fresh OS/heap pages read back as zero, so an uninitialized
+// pointer is null and the engine's `if (ptr)` guards skip the bad path. Under
+// RPCS3, freshly-allocated memory is POISONED with 0xABADCAFE, so those same
+// reads yield a non-null garbage pointer that passes the guards and is then
+// dereferenced / memcpy'd → access violation during scene load (nodes,
+// components, Datums, properties). Zero every allocation so PS3 sees the same
+// zeroed memory the desktop does. Linked via `-Wl,--wrap=malloc` (see
+// Makefile_PS3); operator new/new[] route through malloc, so this covers them
+// too. calloc already zeroes; realloc's grown tail is left as-is (rare path).
+#include <stdlib.h>
+#include <string.h>
+
+extern "C" void* __real_malloc(size_t size);
+extern "C" void* __wrap_malloc(size_t size)
+{
+    void* p = __real_malloc(size);
+    if (p != nullptr) memset(p, 0, size);
+    return p;
+}
+
+// -------------------------------------------------------------------------
+// Safe fstat/stat (avoid the packed sysFSStat syscall crash).
+//
+// PSL1GHT's newlib fstat/stat fill a `__attribute__((packed))` sysFSStat that
+// lands unaligned on the stack; under RPCS3 the lv2 stat syscall's write into
+// it faults on a SUCCESSFUL stat (a missing path errors before the write, which
+// is why reads via sysFsOpen never tripped it — see SYS_DoesFileExist). newlib
+// stdio calls fstat internally on fopen() to pick a buffering mode, so
+// Stream::WriteFile("wb") — used by the save system — crashes the moment it
+// opens a real file. Override the syscall stubs to report a plain regular file
+// (full buffering) without touching sysFsFstat; size is not needed by stdio's
+// buffering decision. Wins over libc.a via -Wl,--allow-multiple-definition.
+#include <sys/stat.h>
+#include <sys/reent.h>
+
+static int Ps3FillRegularStat(struct stat* st)
+{
+    if (st == nullptr) return -1;
+    memset(st, 0, sizeof(struct stat));
+    st->st_mode    = S_IFREG | 0666;
+    st->st_blksize = 4096;
+    st->st_nlink   = 1;
+    return 0;
+}
+
+extern "C" int _fstat_r(struct _reent* /*r*/, int /*fd*/, struct stat* st) { return Ps3FillRegularStat(st); }
+extern "C" int fstat(int /*fd*/, struct stat* st)                          { return Ps3FillRegularStat(st); }
+extern "C" int _fstat(int /*fd*/, struct stat* st)                         { return Ps3FillRegularStat(st); }
+
 #endif // POLYPHASE_PLATFORM_ADDON

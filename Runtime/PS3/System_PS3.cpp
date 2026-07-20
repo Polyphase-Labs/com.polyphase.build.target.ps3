@@ -36,6 +36,8 @@
 
 #include <stdio.h>
 #include <string>
+#include <vector>
+#include <unordered_map>
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
@@ -553,12 +555,50 @@ namespace
     }
 }
 
+// Save-data RAM cache. Game scripts (and their state machines) can read a save
+// slot many times per frame; on desktop that's a cheap stdio hit, but on PS3
+// each read is a lv2 sysFsOpen/Read/Close, and hammering it thousands of times
+// per second overruns RPCS3's file subsystem and hard-crashes the emulator.
+// Serve reads + existence from memory; writes update the cache and the file so
+// the on-disk save stays correct. Keyed by slot name.
+namespace
+{
+    std::unordered_map<std::string, std::vector<char>> sSaveCache;   // slot -> bytes
+    std::unordered_map<std::string, bool>              sSaveExists;  // slot -> exists
+}
+
+bool SYS_DoesSaveExist(const char* saveName)
+{
+    if (saveName == nullptr) return false;
+    auto it = sSaveExists.find(saveName);
+    if (it != sSaveExists.end()) return it->second;
+    const bool exists = SYS_DoesFileExist(SavePath(saveName).c_str(), false);
+    sSaveExists[saveName] = exists;
+    return exists;
+}
+
 bool SYS_ReadSave(const char* saveName, Stream& outStream)
 {
     if (saveName == nullptr) return false;
-    if (!SYS_DoesSaveExist(saveName)) return false;
+
+    // Cached slot — serve from RAM (no file I/O).
+    auto it = sSaveCache.find(saveName);
+    if (it != sSaveCache.end())
+    {
+        if (it->second.empty()) return false;
+        outStream.SetExternalData(it->second.data(), (uint32_t)it->second.size());
+        return true;
+    }
+
+    if (!SYS_DoesSaveExist(saveName)) { sSaveCache[saveName]; return false; }
+
     const std::string path = SavePath(saveName);
     outStream.ReadFile(path.c_str(), /*isAsset=*/false);
+
+    std::vector<char>& cache = sSaveCache[saveName];
+    if (outStream.GetData() != nullptr && outStream.GetSize() > 0)
+        cache.assign(outStream.GetData(), outStream.GetData() + outStream.GetSize());
+
     return outStream.GetSize() > 0;
 }
 
@@ -567,19 +607,26 @@ bool SYS_WriteSave(const char* saveName, Stream& stream)
     if (saveName == nullptr) return false;
     EnsureSaveDirExists();
     const std::string path = SavePath(saveName);
-    return stream.WriteFile(path.c_str());
-}
-
-bool SYS_DoesSaveExist(const char* saveName)
-{
-    if (saveName == nullptr) return false;
-    return SYS_DoesFileExist(SavePath(saveName).c_str(), false);
+    const bool ok = stream.WriteFile(path.c_str());
+    if (ok)
+    {
+        std::vector<char>& cache = sSaveCache[saveName];
+        if (stream.GetData() != nullptr && stream.GetSize() > 0)
+            cache.assign(stream.GetData(), stream.GetData() + stream.GetSize());
+        else
+            cache.clear();
+        sSaveExists[saveName] = true;
+    }
+    return ok;
 }
 
 bool SYS_DeleteSave(const char* saveName)
 {
     if (saveName == nullptr) return false;
-    return sysFsUnlink(SavePath(saveName).c_str()) == 0;
+    const bool ok = sysFsUnlink(SavePath(saveName).c_str()) == 0;
+    sSaveCache.erase(saveName);
+    sSaveExists[saveName] = false;
+    return ok;
 }
 
 void SYS_UnmountMemoryCard() {}

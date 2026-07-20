@@ -261,7 +261,7 @@ void OctPreInitialize(EngineConfig& config)
             // renderer in isolation, skip the default scene and spawn a
             // camera + cube ourselves in OctPostInitialize. Set to 0 to boot
             // the project's real default scene instead.
-#define PS3_RENDER_SMOKE_TEST 1
+#define PS3_RENDER_SMOKE_TEST 0
 #if PS3_RENDER_SMOKE_TEST
             config.mDefaultScene = "";
 #endif
