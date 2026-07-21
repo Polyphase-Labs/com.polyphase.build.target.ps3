@@ -172,6 +172,7 @@ INCDIRS = \
     $(ADDON_PS3_RUNTIME)/compat \
     $(ADDON_PS3_RUNTIME) \
     $(ADDON_PS3_RUNTIME)/Graphics_PS3RSX \
+    $(PSL1GHT)/ppu/include/audio \
     $(POLYPHASE_PATH)/Engine/Source \
     $(POLYPHASE_PATH)/Engine/Source/Engine \
     $(POLYPHASE_PATH)/External \

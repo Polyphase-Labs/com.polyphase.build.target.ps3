@@ -1,0 +1,23 @@
+// PS3/RSX particle vertex program — world/local-space billboard quads.
+// The engine pre-billboards particles (positions already face the camera), so
+// this program only applies the camera MVP. Per-vertex colour carries the
+// particle tint/fade; it is unpacked to 4 floats by the backend (endianness-
+// safe on the big-endian PPU, same as the UI path). mvpMatrix uploaded
+// transposed (glm column-major, Cg mul() row-major).
+void main
+(
+	float3 position : POSITION,
+	float2 texcoord : TEXCOORD0,
+	float4 color    : COLOR0,
+
+	uniform float4x4 mvpMatrix,
+
+	out float4 ePosition : POSITION,
+	out float2 oTexcoord : TEXCOORD0,
+	out float4 oColor    : TEXCOORD1
+)
+{
+	ePosition = mul(mvpMatrix, float4(position, 1.0f));
+	oTexcoord = texcoord;
+	oColor    = color;
+}

@@ -40,9 +40,12 @@
 #include "Engine/Assets/Material.h"
 #include "Engine/Assets/MaterialLite.h"
 #include "Engine/Assets/StaticMesh.h"
+#include "Engine/Assets/SkeletalMesh.h"
 #include "Engine/Assets/Texture.h"
 #include "Engine/Assets/Font.h"
 #include "Engine/Nodes/3D/StaticMesh3d.h"
+#include "Engine/Nodes/3D/SkeletalMesh3d.h"
+#include "Engine/Nodes/3D/Particle3d.h"
 #include "Engine/Nodes/3D/Camera3d.h"
 #include "Engine/Nodes/Widgets/Widget.h"
 #include "Engine/Nodes/Widgets/Quad.h"
@@ -94,18 +97,10 @@ namespace
 
     bool  gInitialized = false;
 
-    // TEMP bisection toggles: isolate whether the ~1s scene-render crash is in
-    // my draw code (RSX) or in game-side Lua logic. false = that draw type is a
-    // no-op (clear+flip still run). Flip back to true once diagnosed.
-    // Real rendering re-enabled after the GetColor()/glm::vec4-return codegen
-    // fault was fixed by reordering GetTexture before GetColor in GFX_DrawQuad.
+    // Master enables for the two draw families (mesh vs UI). Kept as simple
+    // switches for quick A/B testing; both on for normal rendering.
     bool  gDrawMeshEnabled = true;
     bool  gDrawUIEnabled   = true;
-    bool  gUiSkipDraw      = false;
-    bool  gUiSkipPrograms  = false;
-    bool  gUiDoPipeline    = true;    // SetupUIPipeline (blend/depth state)
-    bool  gUiDoTexture     = true;    // BindTextureUnit
-    bool  gUiDoAttribs     = true;    // BindUIAttribs (16-reset + 3 binds)
 
     // ---- Shader programs (Phase 2) --------------------------------------
     rsxVertexProgram*   gUiVp        = nullptr;
@@ -128,7 +123,20 @@ namespace
     rsxProgramConst*    gMeshLightDir  = nullptr;
     rsxProgramConst*    gMeshLightCol  = nullptr;
     rsxProgramConst*    gMeshAmbient   = nullptr;
+    rsxProgramConst*    gMeshFogColor  = nullptr;
+    rsxProgramConst*    gMeshFogParams = nullptr;
+    rsxProgramConst*    gMeshCamPos    = nullptr;
     rsxProgramAttrib*   gMeshTexUnit   = nullptr;
+
+    // Particle program (world-space billboard quads, camera MVP, vertex colour).
+    rsxVertexProgram*   gPartVp        = nullptr;
+    void*               gPartVpUcode   = nullptr;
+    rsxFragmentProgram* gPartFp        = nullptr;
+    u32*                gPartFpBuffer  = nullptr;
+    u32                 gPartFpOffset  = 0;
+    rsxProgramConst*    gPartMvp       = nullptr;
+    rsxProgramConst*    gPartTint      = nullptr;
+    rsxProgramAttrib*   gPartTexUnit   = nullptr;
 
     // 1x1 white texture bound when a draw has no texture (borders, untextured
     // materials) so the sampler multiply is a no-op.
@@ -141,6 +149,20 @@ namespace
     glm::vec3 gLightDir   = glm::normalize(glm::vec3(0.4f, -1.0f, 0.3f));
     glm::vec3 gLightColor = glm::vec3(1.0f);
     glm::vec3 gAmbient    = glm::vec3(0.35f);
+    glm::vec3 gCamPos     = glm::vec3(0.0f);
+
+    // Fog state (set by GFX_SetFog, uploaded to the mesh fragment shader).
+    // gFogParams = (near, far, enabled, densityFunc[0=linear,1=exp]).
+    glm::vec4 gFogColor  = glm::vec4(0.0f);
+    glm::vec4 gFogParams = glm::vec4(0.0f, 100.0f, 0.0f, 0.0f);
+
+    // RSX particle vertex — floats throughout (endian-safe colour). 36 bytes.
+    struct RsxPartVertex
+    {
+        float x, y, z;
+        float u, v;
+        float r, g, b, a;
+    };
 
     // Repacked RSX UI vertex — floats throughout so there is no uint32 colour
     // endianness ambiguity on the big-endian PPU. 32 bytes.
@@ -305,8 +327,26 @@ namespace
         gMeshLightDir = rsxFragmentProgramGetConst(gMeshFp, "lightDir");
         gMeshLightCol = rsxFragmentProgramGetConst(gMeshFp, "lightColor");
         gMeshAmbient  = rsxFragmentProgramGetConst(gMeshFp, "ambient");
+        gMeshFogColor = rsxFragmentProgramGetConst(gMeshFp, "fogColor");
+        gMeshFogParams= rsxFragmentProgramGetConst(gMeshFp, "fogParams");
+        gMeshCamPos   = rsxFragmentProgramGetConst(gMeshFp, "camPos");
 
-        LogDebug("[GFX] shaders loaded (ui fp=%uB mesh fp=%uB)", (unsigned)uiFpSize, (unsigned)meshFpSize);
+        // Particle program.
+        gPartVp = (rsxVertexProgram*)ps3_particle_vpo;
+        gPartFp = (rsxFragmentProgram*)ps3_particle_fpo;
+        rsxVertexProgramGetUCode(gPartVp, &gPartVpUcode, &sz);
+        gPartMvp = rsxVertexProgramGetConst(gPartVp, "mvpMatrix");
+
+        void* partFpUcode = nullptr; u32 partFpSize = 0;
+        rsxFragmentProgramGetUCode(gPartFp, &partFpUcode, &partFpSize);
+        gPartFpBuffer = (u32*)rsxMemalign(64, partFpSize);
+        memcpy(gPartFpBuffer, partFpUcode, partFpSize);
+        rsxAddressToOffset(gPartFpBuffer, &gPartFpOffset);
+        gPartTexUnit = rsxFragmentProgramGetAttrib(gPartFp, "texture");
+        gPartTint    = rsxFragmentProgramGetConst(gPartFp, "tint");
+
+        LogDebug("[GFX] shaders loaded (ui fp=%uB mesh fp=%uB part fp=%uB)",
+                 (unsigned)uiFpSize, (unsigned)meshFpSize, (unsigned)partFpSize);
     }
 
     void MakeWhiteTexture()
@@ -394,6 +434,9 @@ namespace
         if (cam == nullptr) return;
         gViewMatrix = cam->GetViewMatrix();
         gProjMatrix = cam->GetProjectionMatrix();
+        // Camera world position = inverse(view) translation. Robust regardless
+        // of the Node3D world-position accessor name; used for fog distance.
+        gCamPos = glm::vec3(glm::inverse(gViewMatrix)[3]);
     }
 
     void UploadLightData()
@@ -517,39 +560,18 @@ namespace
                 const glm::mat4& model = glm::mat4(1.0f))
     {
         if (!gDrawUIEnabled) return;
-        static int sUIDbg = 0;
-        if (sUIDbg < 30 && buf != nullptr && n > 0)
-        {
-            char b[192];
-            snprintf(b, sizeof(b), "[CK] DrawUI BUILD=20-layout n=%u prim=%u v0=(%.1f,%.1f) v0col=(%.2f,%.2f,%.2f,%.2f) tint=(%.2f,%.2f,%.2f,%.2f) tex=%s ortho=%.0fx%.0f\n",
-                     (unsigned)n, (unsigned)prim, buf[0].x, buf[0].y, buf[0].r, buf[0].g, buf[0].b, buf[0].a,
-                     tint.r, tint.g, tint.b, tint.a, tex ? "Y" : "N",
-                     Renderer::Get() ? (double)Renderer::Get()->GetViewportWidth() : 0.0,
-                     Renderer::Get() ? (double)Renderer::Get()->GetViewportHeight() : 0.0);
-            fputs(b, stdout); fflush(stdout); ++sUIDbg;
-        }
         if (buf == nullptr || n == 0) return;
 
-        if (gUiDoPipeline)
-            SetupUIPipeline();
+        SetupUIPipeline();
+        rsxLoadVertexProgram(gCtx, gUiVp, gUiVpUcode);
+        SetVertexMatrix(gUiVp, gUiOrtho, UIOrtho() * model);
 
-        if (!gUiSkipPrograms)
-        {
-            rsxLoadVertexProgram(gCtx, gUiVp, gUiVpUcode);
-            SetVertexMatrix(gUiVp, gUiOrtho, UIOrtho() * model);
-        }
+        SetFragmentVec4(gUiFp, gUiTint, gUiFpOffset, tint);
+        BindTextureUnit(tex, gUiTexUnit ? (u8)gUiTexUnit->index : 0);
+        rsxLoadFragmentProgramLocation(gCtx, gUiFp, gUiFpOffset, GCM_LOCATION_RSX);
 
-        if (!gUiSkipPrograms)
-            SetFragmentVec4(gUiFp, gUiTint, gUiFpOffset, tint);
-        if (gUiDoTexture)
-            BindTextureUnit(tex, gUiTexUnit ? (u8)gUiTexUnit->index : 0);
-        if (!gUiSkipPrograms)
-            rsxLoadFragmentProgramLocation(gCtx, gUiFp, gUiFpOffset, GCM_LOCATION_RSX);
-
-        if (gUiDoAttribs)
-            BindUIAttribs(buf);
-        if (!gUiSkipDraw)
-            rsxDrawVertexArray(gCtx, prim, 0, n);
+        BindUIAttribs(buf);
+        rsxDrawVertexArray(gCtx, prim, 0, n);
     }
 
     // Allocate/grow an RSX-mapped UI vertex buffer to hold `bytes`.
@@ -681,7 +703,6 @@ bool GFX_ShouldCullLights() { return true; }
 
 void GFX_BeginRenderPass(RenderPassId renderPassId)
 {
-    { static int d=0; if(d<20){ char b[64]; snprintf(b,sizeof(b),"[CK] BeginRenderPass id=%d\n",(int)renderPassId); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     if (renderPassId == RenderPassId::Forward)
     {
@@ -698,7 +719,6 @@ void GFX_EndRenderPass() {}
 
 void GFX_SetPipelineState(PipelineConfig config)
 {
-    { static int d=0; if(d<20){ char b[64]; snprintf(b,sizeof(b),"[CK] SetPipeline cfg=%d\n",(int)config); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     switch (config)
     {
@@ -725,18 +745,15 @@ void GFX_SetPipelineState(PipelineConfig config)
 
 void GFX_SetViewport(int32_t x, int32_t y, int32_t w, int32_t h, bool /*handlePrerotation*/)
 {
-    { static int d=0; if(d<20){ char b[96]; snprintf(b,sizeof(b),"[CK] SetViewport x=%d y=%d w=%d h=%d\n",x,y,w,h); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     SetViewportRSX(x, y, w, h);
 }
 void GFX_SetScissor(int32_t x, int32_t y, int32_t w, int32_t h, bool /*handlePrerotation*/)
 {
-    { static int d=0; if(d<20){ char b[96]; snprintf(b,sizeof(b),"[CK] SetScissor x=%d y=%d w=%d h=%d\n",x,y,w,h); fputs(b,stdout); fflush(stdout); ++d; } }
     if (!gInitialized) return;
     if (w <= 0 || h <= 0) { x = 0; y = 0; w = (int32_t)gDisplayWidth; h = (int32_t)gDisplayHeight; }
     rsxSetScissor(gCtx, (u16)glm::max(0, x), (u16)glm::max(0, y),
                   (u16)glm::min((int32_t)gDisplayWidth, w), (u16)glm::min((int32_t)gDisplayHeight, h));
-    { static int d=0; if(d<20){ fputs("[CK] SetScissor OK\n",stdout); fflush(stdout); ++d; } }
 }
 
 glm::mat4 GFX_MakePerspectiveMatrix(float fovyDegrees, float aspectRatio, float zNear, float zFar)
@@ -748,7 +765,16 @@ glm::mat4 GFX_MakeOrthographicMatrix(float left, float right, float bottom, floa
     return glm::ortho(left, right, bottom, top, zNear, zFar);
 }
 
-void GFX_SetFog(const FogSettings& /*fogSettings*/) {}
+void GFX_SetFog(const FogSettings& fog)
+{
+    // Stored here; uploaded to the mesh fragment shader per draw. Distance is
+    // world-space camera->fragment; near/far are world units. Linear vs
+    // exponential falloff selected by densityFunc (enum: Linear=0, Exp=1).
+    gFogColor  = fog.mColor;
+    gFogParams = glm::vec4(fog.mNear, fog.mFar,
+                           fog.mEnabled ? 1.0f : 0.0f,
+                           float((int32_t)fog.mDensityFunc));
+}
 void GFX_DrawLines(const std::vector<Line>& /*lines*/) {}
 void GFX_DrawFullscreen() {}
 void GFX_ResizeWindow() {}
@@ -789,7 +815,6 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& /*data*/)
     // the vector and crash. Skip it (the sampler falls back to the white texel)
     // rather than fault. Real format support is a later phase.
     const size_t rgba8Bytes = (size_t)srcW * (size_t)srcH * 4u;
-    { char b[160]; snprintf(b, sizeof(b), "[CK] GFX_CreateTex %ux%u pixels=%u need=%u fmt=%d\n", (unsigned)srcW, (unsigned)srcH, (unsigned)pixels.size(), (unsigned)rgba8Bytes, (int)texture->GetFormat()); fputs(b, stdout); fflush(stdout); }
     if (pixels.size() < rgba8Bytes)
     {
         LogWarning("[GFX] texture '%s' is not RGBA8 (%u px bytes, need %u) — skipping (white fallback)",
@@ -921,48 +946,55 @@ void GFX_DestroyStaticMeshResource(StaticMesh* staticMesh)
     r->mNumVertices = r->mNumIndices = r->mVertexStride = r->mVertexFlags = 0;
 }
 
-void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
+// Draw an indexed lit mesh (static OR CPU-skinned skeletal) with the mesh
+// shader. vertexData/indexData are RSX-mapped; the skinned vertices are plain
+// engine `Vertex` (pos@0/uv@12/normal@28), identical layout to static meshes,
+// so both paths share this. matBase may be null (default material).
+static void DrawLitMesh(void* vertexData, uint32_t stride, void* indexData, uint32_t numIndices,
+                        Material* matBase, const glm::mat4& world)
 {
-    if (!gDrawMeshEnabled) return;
-    if (!gInitialized || comp == nullptr) return;
-
-    StaticMesh* mesh = meshOverride ? meshOverride : comp->GetStaticMesh();
-    if (mesh == nullptr) return;
-    StaticMeshResource* r = mesh->GetResource();
-    if (r == nullptr || r->mVertexData == nullptr || r->mIndexData == nullptr || r->mNumIndices == 0) return;
-
-    Material* matBase = comp->GetMaterial();
     MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
     Texture* tex = mat ? mat->GetTexture(0) : nullptr;
 
     glm::vec4 matColor(1.0f);
     bool unlit = false;
+    int  fogMode = 0;   // 0=off, 1=distance, 2=sky/horizon (matches engine Vulkan path)
     if (mat != nullptr)
     {
         matColor = mat->GetColor();
         const BlendMode blend = mat->GetBlendMode();
         if (blend == BlendMode::Translucent || blend == BlendMode::Additive) matColor.a = mat->GetOpacity();
         unlit = (mat->GetShadingModel() == ShadingModel::Unlit);
+        // The skybox is uniquely Unlit + depth-test-disabled + negative sort
+        // priority → horizon fog; other fog materials get radial distance fog.
+        if (gFogParams.z > 0.5f && mat->ShouldApplyFog())
+        {
+            const bool isSky = unlit && mat->IsDepthTestDisabled() && (mat->GetSortPriority() < 0);
+            fogMode = isSky ? 2 : 1;
+        }
     }
 
     SetupMeshPipeline();
 
-    const glm::mat4& world = comp->GetRenderTransform();
     const glm::mat4 mvp = gProjMatrix * gViewMatrix * world;
-
     rsxLoadVertexProgram(gCtx, gMeshVp, gMeshVpUcode);
     SetVertexMatrix(gMeshVp, gMeshMvp, mvp);
     SetVertexMatrix(gMeshVp, gMeshModel, world);
+
+    // fogParams = (near, far, mode[0/1/2], densityFunc); fogColor.a = intensity.
+    const glm::vec4 fogParams(gFogParams.x, gFogParams.y, float(fogMode), gFogParams.w);
 
     SetFragmentVec4(gMeshFp, gMeshMatColor, gMeshFpOffset, matColor);
     SetFragmentVec3(gMeshFp, gMeshLightDir, gMeshFpOffset, gLightDir);
     SetFragmentVec3(gMeshFp, gMeshLightCol, gMeshFpOffset, unlit ? glm::vec3(0.0f) : gLightColor);
     SetFragmentVec3(gMeshFp, gMeshAmbient,  gMeshFpOffset, unlit ? glm::vec3(1.0f) : gAmbient);
+    SetFragmentVec4(gMeshFp, gMeshFogColor, gMeshFpOffset, gFogColor);
+    SetFragmentVec4(gMeshFp, gMeshFogParams, gMeshFpOffset, fogParams);
+    SetFragmentVec3(gMeshFp, gMeshCamPos,   gMeshFpOffset, gCamPos);
     BindTextureUnit(tex, gMeshTexUnit ? (u8)gMeshTexUnit->index : 0);
     rsxLoadFragmentProgramLocation(gCtx, gMeshFp, gMeshFpOffset, GCM_LOCATION_RSX);
 
-    const uint8_t* vbuf = (const uint8_t*)r->mVertexData;
-    const uint32_t stride = r->mVertexStride;
+    const uint8_t* vbuf = (const uint8_t*)vertexData;
     u32 off;
     rsxAddressToOffset((void*)(vbuf + 0),  &off);
     rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_POS,    0, off, stride, 3, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
@@ -975,22 +1007,42 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
     rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_COLOR0, 0, 0, 0, 0, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
 
     u32 ioff;
-    rsxAddressToOffset(r->mIndexData, &ioff);
-    rsxDrawIndexArray(gCtx, GCM_TYPE_TRIANGLES, ioff, r->mNumIndices, GCM_INDEX_TYPE_16B, GCM_LOCATION_RSX);
+    rsxAddressToOffset(indexData, &ioff);
+    rsxDrawIndexArray(gCtx, GCM_TYPE_TRIANGLES, ioff, numIndices, GCM_INDEX_TYPE_16B, GCM_LOCATION_RSX);
+}
+
+void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
+{
+    if (!gDrawMeshEnabled || !gInitialized || comp == nullptr) return;
+    StaticMesh* mesh = meshOverride ? meshOverride : comp->GetStaticMesh();
+    if (mesh == nullptr) return;
+    StaticMeshResource* r = mesh->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr || r->mIndexData == nullptr || r->mNumIndices == 0) return;
+    DrawLitMesh(r->mVertexData, r->mVertexStride, r->mIndexData, r->mNumIndices,
+                comp->GetMaterial(), comp->GetRenderTransform());
 }
 
 // =========================================================================
 // UI — Quad / QuadBorder / Text / Poly
 // =========================================================================
 
+// TEMP diagnostic: exercise the RSX allocator. If its heap context has been
+// corrupted (the scene-load freeze), rsxMemalign faults HERE — so the last
+// "canary <tag> OK" logged before the freeze localizes the corrupting step.
+void GFX_HeapCanary(const char* tag)
+{
+    { char b[96]; snprintf(b,sizeof(b),"[CK] canary %s enter\n", tag ? tag : "?"); fputs(b,stdout); fflush(stdout); }
+    void* c = rsxMemalign(128, 16);
+    if (c) rsxFree(c);
+    { char b[96]; snprintf(b,sizeof(b),"[CK] canary %s OK p=%p\n", tag ? tag : "?", c); fputs(b,stdout); fflush(stdout); }
+}
+
 void GFX_CreateQuadResource(Quad* quad)
 {
     if (quad == nullptr) return;
     QuadResource* r = quad->GetResource();
     if (r == nullptr) return;
-    { char b[128]; snprintf(b, sizeof(b), "[CK] GFX_CreateQuadResource r=%p mVertexData=%p cap=%u\n", (void*)r, r->mVertexData, (unsigned)r->mVertexCapacity); fputs(b, stdout); fflush(stdout); }
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, Quad::kMaxQuadVertices * sizeof(RsxUIVertex));
-    { fputs("[CK] GFX_CreateQuadResource done\n", stdout); fflush(stdout); }
 }
 void GFX_DestroyQuadResource(Quad* quad)
 {
@@ -1002,7 +1054,6 @@ void GFX_DestroyQuadResource(Quad* quad)
 }
 void GFX_UpdateQuadResourceVertexData(Quad* quad)
 {
-    { static int d=0; if(d<6){ char b[96]; snprintf(b,sizeof(b),"[CK] enter UpdQuad quad=%p n=%u\n",(void*)quad, quad?(unsigned)quad->GetNumVertices():0u); fputs(b,stdout); fflush(stdout); ++d; } }
     if (quad == nullptr) return;
     QuadResource* r = quad->GetResource();
     if (r == nullptr) return;
@@ -1076,7 +1127,6 @@ void GFX_DestroyTextResource(Text* text)
 }
 void GFX_UpdateTextResourceVertexData(Text* text)
 {
-    { static int d=0; if(d<8){ fputs("[CK] enter UpdText\n",stdout); fflush(stdout); ++d; } }
     if (text == nullptr) return;
     TextResource* r = text->GetResource();
     if (r == nullptr) return;
@@ -1097,7 +1147,6 @@ void GFX_UpdateTextResourceVertexData(Text* text)
 }
 void GFX_DrawText(Text* text)
 {
-    { static int d=0; if(d<8){ fputs("[CK] enter DrawText\n",stdout); fflush(stdout); ++d; } }
     if (!gInitialized || text == nullptr) return;
     TextResource* r = text->GetResource();
     if (r == nullptr || r->mVertexData == nullptr) return;
@@ -1169,18 +1218,95 @@ void GFX_DrawPoly(Poly* poly)
 // Remaining GFX_* surface — stubs slotted on top of this foundation later.
 // =========================================================================
 
-void GFX_CreateSkeletalMeshResource(SkeletalMesh* /*skeletalMesh*/, uint32_t /*numVertices*/, VertexSkinned* /*vertices*/, uint32_t /*numIndices*/, IndexType* /*indices*/) {}
-void GFX_DestroySkeletalMeshResource(SkeletalMesh* /*skeletalMesh*/) {}
+// Skeletal mesh: the engine CPU-skins each frame into a std::vector<Vertex>
+// (same layout as static Vertex) and hands it to the per-component buffer; the
+// mesh ASSET resource keeps only the (static) index buffer. Draw = indices from
+// the mesh resource + skinned verts from the comp resource, via DrawLitMesh.
+void GFX_CreateSkeletalMeshResource(SkeletalMesh* skeletalMesh, uint32_t /*numVertices*/, VertexSkinned* /*vertices*/, uint32_t numIndices, IndexType* indices)
+{
+    if (skeletalMesh == nullptr || indices == nullptr || numIndices == 0) return;
+    SkeletalMeshResource* r = skeletalMesh->GetResource();
+    if (r == nullptr) return;
+    const uint32_t iBytes = sizeof(IndexType) * numIndices;
+    void* iBuf = rsxMemalign(128, iBytes);
+    if (iBuf == nullptr) return;
+    memcpy(iBuf, indices, iBytes);
+    r->mIndexData  = iBuf;
+    r->mNumIndices = numIndices;
+}
+void GFX_DestroySkeletalMeshResource(SkeletalMesh* skeletalMesh)
+{
+    if (skeletalMesh == nullptr) return;
+    SkeletalMeshResource* r = skeletalMesh->GetResource();
+    if (r == nullptr) return;
+    if (r->mIndexData != nullptr) { rsxFree(r->mIndexData); r->mIndexData = nullptr; }
+    r->mNumIndices = 0;
+}
 
 void GFX_CreateStaticMeshCompResource(StaticMesh3D* /*staticMeshComp*/) {}
 void GFX_DestroyStaticMeshCompResource(StaticMesh3D* /*staticMeshComp*/) {}
 void GFX_UpdateStaticMeshCompResourceColors(StaticMesh3D* /*staticMeshComp*/) {}
 
-void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* /*skeletalMeshComp*/) {}
-void GFX_DestroySkeletalMeshCompResource(SkeletalMesh3D* /*skeletalMeshComp*/) {}
-void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* /*skeletalMeshComp*/, uint32_t /*numVertices*/) {}
-void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* /*skeletalMeshComp*/, const std::vector<Vertex>& /*skinnedVertices*/) {}
-void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* /*skeletalMeshComp*/) {}
+void GFX_CreateSkeletalMeshCompResource(SkeletalMesh3D* /*skeletalMeshComp*/) {}   // lazy alloc
+void GFX_DestroySkeletalMeshCompResource(SkeletalMesh3D* skeletalMeshComp)
+{
+    if (skeletalMeshComp == nullptr) return;
+    SkeletalMeshCompResource* r = skeletalMeshComp->GetResource();
+    if (r == nullptr) return;
+    if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
+    r->mVertexCapacity = r->mNumVertices = r->mVertexStride = 0;
+}
+void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, uint32_t numVertices)
+{
+    if (skeletalMeshComp == nullptr || numVertices == 0) return;
+    SkeletalMeshCompResource* r = skeletalMeshComp->GetResource();
+    if (r == nullptr) return;
+    const uint32_t stride = sizeof(Vertex);
+    const uint32_t needed = stride * numVertices;
+    if (r->mVertexData != nullptr && r->mVertexCapacity >= needed)
+    {
+        r->mNumVertices  = numVertices;
+        r->mVertexStride = stride;
+        return;
+    }
+    if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
+    r->mVertexData     = rsxMemalign(128, needed);
+    r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
+    r->mNumVertices    = (r->mVertexData != nullptr) ? numVertices : 0;
+    r->mVertexStride   = stride;
+}
+void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, const std::vector<Vertex>& skinnedVertices)
+{
+    if (skeletalMeshComp == nullptr || skinnedVertices.empty()) return;
+    SkeletalMeshCompResource* r = skeletalMeshComp->GetResource();
+    if (r == nullptr) return;
+    const uint32_t stride = sizeof(Vertex);
+    const uint32_t n      = (uint32_t)skinnedVertices.size();
+    const uint32_t needed = stride * n;
+    if (r->mVertexData == nullptr || r->mVertexCapacity < needed)
+    {
+        if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
+        r->mVertexData     = rsxMemalign(128, needed);
+        r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
+    }
+    if (r->mVertexData == nullptr) return;
+    memcpy(r->mVertexData, skinnedVertices.data(), needed);
+    r->mNumVertices  = n;
+    r->mVertexStride = stride;
+}
+void GFX_DrawSkeletalMeshComp(SkeletalMesh3D* skeletalMeshComp)
+{
+    if (!gDrawMeshEnabled || !gInitialized || skeletalMeshComp == nullptr) return;
+    SkeletalMesh* mesh = skeletalMeshComp->GetSkeletalMesh();
+    if (mesh == nullptr) return;
+    SkeletalMeshResource*     mr = mesh->GetResource();
+    SkeletalMeshCompResource* cr = skeletalMeshComp->GetResource();
+    if (mr == nullptr || cr == nullptr) return;
+    if (mr->mIndexData == nullptr || mr->mNumIndices == 0) return;
+    if (cr->mVertexData == nullptr || cr->mNumVertices == 0) return;
+    DrawLitMesh(cr->mVertexData, cr->mVertexStride, mr->mIndexData, mr->mNumIndices,
+                skeletalMeshComp->GetMaterial(), skeletalMeshComp->GetRenderTransform());
+}
 bool GFX_IsCpuSkinningRequired(SkeletalMesh3D* /*skeletalMeshComp*/) { return true; }
 
 void GFX_DrawShadowMeshComp(ShadowMesh3D* /*shadowMeshComp*/) {}
@@ -1206,10 +1332,109 @@ void GFX_DestroyTileMap2DResource(TileMap2D* /*tileMap*/) {}
 void GFX_UpdateTileMap2DResource(TileMap2D* /*tileMap*/, const std::vector<VertexColor>& /*vertices*/, const std::vector<IndexType>& /*indices*/) {}
 void GFX_DrawTileMap2D(TileMap2D* /*tileMap*/) {}
 
-void GFX_CreateParticleCompResource(Particle3D* /*particleComp*/) {}
-void GFX_DestroyParticleCompResource(Particle3D* /*particleComp*/) {}
-void GFX_UpdateParticleCompVertexBuffer(Particle3D* /*particleComp*/, const std::vector<VertexParticle>& /*vertices*/) {}
-void GFX_DrawParticleComp(Particle3D* /*particleComp*/) {}
+// Particles: the engine emits 4 world-space (pre-billboarded) verts per
+// particle; we expand to 2 triangles and repack colour to floats (endian-safe).
+// Draw uses the camera MVP (model = local transform or identity) + the particle
+// shader (pos3/uv/vertex-colour, textured, material-tinted).
+void GFX_CreateParticleCompResource(Particle3D* /*particleComp*/) {}   // lazy alloc
+void GFX_DestroyParticleCompResource(Particle3D* particleComp)
+{
+    if (particleComp == nullptr) return;
+    ParticleCompResource* r = particleComp->GetResource();
+    if (r == nullptr) return;
+    if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
+    r->mVertexCapacity = r->mNumVertices = r->mVertexStride = 0;
+}
+void GFX_UpdateParticleCompVertexBuffer(Particle3D* particleComp, const std::vector<VertexParticle>& vertices)
+{
+    if (particleComp == nullptr) return;
+    ParticleCompResource* r = particleComp->GetResource();
+    if (r == nullptr) return;
+    const uint32_t numParticles = (uint32_t)vertices.size() / 4u;
+    if (numParticles == 0) { r->mNumVertices = 0; return; }
+
+    const uint32_t outVerts = numParticles * 6u;
+    const uint32_t stride   = sizeof(RsxPartVertex);
+    const uint32_t needed   = outVerts * stride;
+    if (r->mVertexData == nullptr || r->mVertexCapacity < needed)
+    {
+        if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
+        r->mVertexData     = rsxMemalign(128, needed);
+        r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
+    }
+    if (r->mVertexData == nullptr) { r->mNumVertices = 0; return; }
+
+    // Quad corners 0=TL 1=BL 2=TR 3=BR → triangles (0,1,2)(2,1,3).
+    static const int kIdx[6] = { 0, 1, 2, 2, 1, 3 };
+    RsxPartVertex* dst = (RsxPartVertex*)r->mVertexData;
+    for (uint32_t p = 0; p < numParticles; ++p)
+    {
+        const VertexParticle* quad = &vertices[p * 4u];
+        for (int k = 0; k < 6; ++k)
+        {
+            const VertexParticle& s = quad[kIdx[k]];
+            RsxPartVertex& d = dst[p * 6u + k];
+            d.x = s.mPosition.x; d.y = s.mPosition.y; d.z = s.mPosition.z;
+            d.u = s.mTexcoord.x; d.v = s.mTexcoord.y;
+            const uint32_t c = s.mColor;   // engine packs R in the low byte
+            d.r = float(c & 0xFF)         / 255.0f;
+            d.g = float((c >> 8)  & 0xFF) / 255.0f;
+            d.b = float((c >> 16) & 0xFF) / 255.0f;
+            d.a = float((c >> 24) & 0xFF) / 255.0f;
+        }
+    }
+    r->mNumVertices  = outVerts;
+    r->mVertexStride = stride;
+}
+void GFX_DrawParticleComp(Particle3D* particleComp)
+{
+    if (!gDrawMeshEnabled || !gInitialized || particleComp == nullptr) return;
+    ParticleCompResource* r = particleComp->GetResource();
+    if (r == nullptr || r->mVertexData == nullptr || r->mNumVertices == 0) return;
+
+    Material* matBase = particleComp->GetMaterial();
+    MaterialLite* mat = Material::AsLite(matBase ? matBase : Renderer::Get()->GetDefaultMaterial());
+    Texture* tex = mat ? mat->GetTexture(0) : nullptr;
+    const BlendMode blend = mat ? mat->GetBlendMode() : BlendMode::Translucent;
+    const bool localSpace = particleComp->GetUseLocalSpace();
+
+    // Blend on, depth test on but no depth write (translucent sprites shouldn't
+    // occlude each other). Additive uses ONE, else src/one-minus-src alpha.
+    rsxSetBlendEnable(gCtx, GCM_TRUE);
+    rsxSetBlendFunc(gCtx, GCM_SRC_ALPHA,
+                    (blend == BlendMode::Additive) ? GCM_ONE : GCM_ONE_MINUS_SRC_ALPHA,
+                    GCM_SRC_ALPHA,
+                    (blend == BlendMode::Additive) ? GCM_ONE : GCM_ONE_MINUS_SRC_ALPHA);
+    rsxSetBlendEquation(gCtx, GCM_FUNC_ADD, GCM_FUNC_ADD);
+    rsxSetDepthTestEnable(gCtx, GCM_TRUE);
+    rsxSetDepthWriteEnable(gCtx, GCM_FALSE);
+    rsxSetCullFaceEnable(gCtx, GCM_FALSE);
+
+    const glm::mat4 model = localSpace ? particleComp->GetTransform() : glm::mat4(1.0f);
+    const glm::mat4 mvp   = gProjMatrix * gViewMatrix * model;
+    // GetColor() (glm::vec4 by value) kept last — ppu-gcc codegen hazard.
+    const glm::vec4 tint  = mat ? mat->GetColor() : glm::vec4(1.0f);
+
+    rsxLoadVertexProgram(gCtx, gPartVp, gPartVpUcode);
+    SetVertexMatrix(gPartVp, gPartMvp, mvp);
+    SetFragmentVec4(gPartFp, gPartTint, gPartFpOffset, tint);
+    BindTextureUnit(tex, gPartTexUnit ? (u8)gPartTexUnit->index : 0);
+    rsxLoadFragmentProgramLocation(gCtx, gPartFp, gPartFpOffset, GCM_LOCATION_RSX);
+
+    const uint8_t* vbuf = (const uint8_t*)r->mVertexData;
+    const uint32_t stride = r->mVertexStride;
+    u32 off;
+    rsxAddressToOffset((void*)(vbuf + 0),  &off);
+    rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_POS,    0, off, stride, 3, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
+    rsxAddressToOffset((void*)(vbuf + 12), &off);
+    rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_TEX0,   0, off, stride, 2, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
+    rsxAddressToOffset((void*)(vbuf + 20), &off);
+    rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_COLOR0, 0, off, stride, 4, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
+    // Disable NORMAL(attr 2) a prior mesh draw may have left enabled.
+    rsxBindVertexArrayAttrib(gCtx, GCM_VERTEX_ATTRIB_NORMAL, 0, 0, 0, 0, GCM_VERTEX_DATA_TYPE_F32, GCM_LOCATION_RSX);
+
+    rsxDrawVertexArray(gCtx, GCM_TYPE_TRIANGLES, 0, r->mNumVertices);
+}
 
 void GFX_DrawStaticMesh(StaticMesh* /*mesh*/, Material* /*material*/, const glm::mat4& /*transform*/, glm::vec4 /*color*/) {}
 void GFX_RenderPostProcessPasses() {}

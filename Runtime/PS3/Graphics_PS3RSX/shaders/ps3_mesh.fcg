@@ -7,12 +7,16 @@ void main
 (
 	float2 texcoord : TEXCOORD0,
 	float3 normal   : TEXCOORD1,
+	float3 worldPos : TEXCOORD2,
 
 	uniform sampler2D texture,
 	uniform float4    matColor,
 	uniform float3    lightDir,     // normalized, world space, points FROM light
 	uniform float3    lightColor,
 	uniform float3    ambient,
+	uniform float4    fogColor,     // rgb + a=intensity
+	uniform float4    fogParams,    // x=near y=far z=mode(0 off,1 dist,2 sky) w=func(0 lin,1 exp)
+	uniform float3    camPos,       // camera world position (fog origin)
 
 	out float4 oColor
 )
@@ -21,5 +25,32 @@ void main
 	float  ndl = max(dot(N, -lightDir), 0.0f);
 	float3 lighting = ambient + lightColor * ndl;
 	float4 tex = tex2D(texture, texcoord);
-	oColor = tex * matColor * float4(lighting, 1.0f);
+	float4 lit = tex * matColor * float4(lighting, 1.0f);
+
+	// fogFactor: 0 = no fog, 1 = full fog color. Matches engine Fog.glsl.
+	if (fogParams.z > 0.5f)
+	{
+		float3 toFrag = worldPos - camPos;
+		float  fogFactor;
+		if (fogParams.z > 1.5f)
+		{
+			// Sky/horizon fog: fade by the view ray's elevation. Full at/below
+			// the horizon, clearing toward the zenith (ApplyFogSky).
+			float3 dir = normalize(toFrag);
+			float  t = saturate(dir.y / 0.25f);
+			fogFactor = (1.0f - smoothstep(0.0f, 1.0f, t)) * fogColor.a;
+		}
+		else
+		{
+			// Radial distance fog (ApplyFog).
+			float dist = length(toFrag);
+			float fogAlpha = saturate((dist - fogParams.x) / max(fogParams.y - fogParams.x, 0.0001f)) * fogColor.a;
+			if (fogParams.w < 0.5f)
+				fogFactor = fogAlpha;
+			else
+				fogFactor = 1.0f - saturate(pow(20.0f, -fogAlpha));
+		}
+		lit.rgb = lerp(lit.rgb, fogColor.rgb, fogFactor);
+	}
+	oColor = lit;
 }

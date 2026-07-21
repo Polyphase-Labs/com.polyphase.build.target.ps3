@@ -2,8 +2,9 @@
 // Engine `Vertex` / `VertexColor` share pos@0 / uv0@12 / normal@28, so one
 // program serves both; vertex colour is ignored for this first lit pass.
 // mvpMatrix = proj*view*model; modelMatrix transforms the normal to world
-// space for the fragment lighting. Both are uploaded transposed by the backend
-// (glm is column-major, Cg mul() expects row-major).
+// space for the fragment lighting AND the position to world space for fog.
+// Both are uploaded transposed by the backend (glm is column-major, Cg mul()
+// expects row-major).
 void main
 (
 	float3 position : POSITION,
@@ -15,10 +16,12 @@ void main
 
 	out float4 ePosition : POSITION,
 	out float2 oTexcoord : TEXCOORD0,
-	out float3 oNormal   : TEXCOORD1
+	out float3 oNormal   : TEXCOORD1,
+	out float3 oWorldPos : TEXCOORD2
 )
 {
 	ePosition = mul(mvpMatrix, float4(position, 1.0f));
 	oTexcoord = texcoord;
 	oNormal   = mul(modelMatrix, float4(normal, 0.0f)).xyz;
+	oWorldPos = mul(modelMatrix, float4(position, 1.0f)).xyz;
 }

@@ -8,7 +8,10 @@
 # the Windows cg.dll equivalent).
 set -e
 CG=/usr/local/ps3dev/bin/cgcomp
-CG_LIB_DIR="${CG_LIB_DIR:-/tmp/cgtk/usr/lib64}"
+# libCg.so location (NVIDIA Cg toolkit). /tmp is wiped on reboot, so keep it in
+# a persistent dir; re-fetch from the web.archive Cg-3.1 tgz if missing.
+CG_LIB_DIR="${CG_LIB_DIR:-/home/vltmedia/cglib}"
+[ -f "$CG_LIB_DIR/libCg.so" ] || CG_LIB_DIR=/tmp/cgtk/usr/lib64
 export LD_LIBRARY_PATH="$CG_LIB_DIR:$LD_LIBRARY_PATH"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="$DIR/Ps3Shaders_gen.h"
@@ -33,10 +36,14 @@ emit_array() {
     "$CG" -f "$DIR/ps3_ui.fcg"   "$TMP/ps3_ui_fpo"   >/dev/null
     "$CG" -v "$DIR/ps3_mesh.vcg" "$TMP/ps3_mesh_vpo" >/dev/null
     "$CG" -f "$DIR/ps3_mesh.fcg" "$TMP/ps3_mesh_fpo" >/dev/null
+    "$CG" -v "$DIR/ps3_particle.vcg" "$TMP/ps3_particle_vpo" >/dev/null
+    "$CG" -f "$DIR/ps3_particle.fcg" "$TMP/ps3_particle_fpo" >/dev/null
     emit_array ps3_ui_vpo   "$TMP/ps3_ui_vpo"
     emit_array ps3_ui_fpo   "$TMP/ps3_ui_fpo"
     emit_array ps3_mesh_vpo "$TMP/ps3_mesh_vpo"
     emit_array ps3_mesh_fpo "$TMP/ps3_mesh_fpo"
+    emit_array ps3_particle_vpo "$TMP/ps3_particle_vpo"
+    emit_array ps3_particle_fpo "$TMP/ps3_particle_fpo"
 } > "$OUT"
 
 rm -rf "$TMP"
