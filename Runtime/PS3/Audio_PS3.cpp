@@ -104,10 +104,6 @@ namespace
 
     static float sMix[kBlockFrames * 2];   // stereo float scratch
 
-    // Audio re-enabled: the scene-load crash was the Quad/UI path, never audio.
-    static bool gAudioMixerThreadEnabled = true;   // start the concurrent mixer thread
-    static bool gAudioInitEnabled         = true;   // do libaudio init at all
-
     inline void Lock()   { if (sLockValid) sysMutexLock(sLock, 0); }
     inline void Unlock() { if (sLockValid) sysMutexUnlock(sLock); }
 
@@ -222,10 +218,6 @@ namespace
 
 void AUD_Initialize()
 {
-    // TEMP: fully disable audio init (no module load / port) to isolate a
-    // scene-load crash. Flip back to run real audio.
-    if (!gAudioInitEnabled) { LogDebug("Audio_PS3: init DISABLED (diagnostic)"); return; }
-
     if (sysModuleLoad(SYSMODULE_AUDIO) != 0)
     {
         LogError("Audio_PS3: sysModuleLoad(SYSMODULE_AUDIO) failed — silent");
@@ -280,25 +272,20 @@ void AUD_Initialize()
 
     audioPortStart(sPortNum);
 
-    // TEMP: gate the mixer thread to isolate a scene-load crash. When off, the
-    // port is open (silence) but no concurrent thread runs.
-    if (gAudioMixerThreadEnabled)
+    sMixerRun = true;
+    if (sysThreadCreate(&sMixerThread, &MixerThread, nullptr, 1000, 0x4000,
+                        THREAD_JOINABLE, (char*)"polyaud_mixer") == 0)
     {
-        sMixerRun = true;
-        if (sysThreadCreate(&sMixerThread, &MixerThread, nullptr, 1000, 0x4000,
-                            THREAD_JOINABLE, (char*)"polyaud_mixer") == 0)
-        {
-            sThreadValid = true;
-        }
-        else
-        {
-            LogError("Audio_PS3: mixer thread create failed — silent");
-            sMixerRun = false;
-        }
+        sThreadValid = true;
+    }
+    else
+    {
+        LogError("Audio_PS3: mixer thread create failed — silent");
+        sMixerRun = false;
     }
 
     LogDebug("Audio_PS3: libaudio up, port=%u 48000Hz stereo, %u blocks, %d voices, mixer=%d",
-             (unsigned)sPortNum, (unsigned)sNumBlocks, AUDIO_MAX_VOICES, (int)gAudioMixerThreadEnabled);
+             (unsigned)sPortNum, (unsigned)sNumBlocks, AUDIO_MAX_VOICES, (int)sThreadValid);
 }
 
 void AUD_Shutdown()

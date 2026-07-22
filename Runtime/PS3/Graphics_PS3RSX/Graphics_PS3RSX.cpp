@@ -582,6 +582,18 @@ namespace
         *data = rsxMemalign(128, bytes);
         *cap  = (*data != nullptr) ? bytes : 0;
     }
+
+    // [CK] TEMP diagnostic: exercise the RSX heap allocator. If the heap context
+    // (loaded from a GOT slot) has been corrupted by a prior wild write, this
+    // rsxMemalign faults HERE — so the last "canary <tag> OK" logged before the
+    // freeze pins which scene-load step corrupted the heap. Addon-local only.
+    void Canary(const char* tag)
+    {
+        { char b[96]; snprintf(b, sizeof(b), "[CK] canary %s enter\n", tag ? tag : "?"); fputs(b, stdout); fflush(stdout); }
+        void* c = rsxMemalign(128, 16);
+        if (c) rsxFree(c);
+        { char b[96]; snprintf(b, sizeof(b), "[CK] canary %s OK p=%p\n", tag ? tag : "?", c); fputs(b, stdout); fflush(stdout); }
+    }
 }
 
 // =========================================================================
@@ -672,6 +684,7 @@ void GFX_BeginFrame()
     // advancement). Must run every frame or RPCS3's display subsystem backs up.
     sysUtilCheckCallback();
     if (!gInitialized) return;
+    { static int f=0; if (f<2) { char b[32]; snprintf(b,sizeof(b),"frame%d",f); Canary(b); ++f; } }
 
     // Clear the back buffer to the engine's clear colour, then leave 3D state
     // ready for the Forward pass. Real draws land between here and EndFrame.
@@ -799,6 +812,7 @@ void GFX_EndGpuTimestamp(const char* /*name*/) {}
 void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& /*data*/)
 {
     if (texture == nullptr) return;
+    Canary(("tex-" + texture->GetName()).c_str());
     TextureResource* r = texture->GetResource();
     if (r == nullptr) return;
 
@@ -906,6 +920,7 @@ void GFX_DestroyMaterialResource(Material* /*material*/) {}
 
 void GFX_CreateStaticMeshResource(StaticMesh* staticMesh, bool hasColor, uint32_t numVertices, void* vertices, uint32_t numIndices, IndexType* indices)
 {
+    Canary(staticMesh ? ("smesh-" + staticMesh->GetName()).c_str() : "smesh-null");
     if (staticMesh == nullptr || vertices == nullptr || indices == nullptr) return;
     if (numVertices == 0 || numIndices == 0) return;
 
@@ -1026,23 +1041,14 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
 // UI — Quad / QuadBorder / Text / Poly
 // =========================================================================
 
-// TEMP diagnostic: exercise the RSX allocator. If its heap context has been
-// corrupted (the scene-load freeze), rsxMemalign faults HERE — so the last
-// "canary <tag> OK" logged before the freeze localizes the corrupting step.
-void GFX_HeapCanary(const char* tag)
-{
-    { char b[96]; snprintf(b,sizeof(b),"[CK] canary %s enter\n", tag ? tag : "?"); fputs(b,stdout); fflush(stdout); }
-    void* c = rsxMemalign(128, 16);
-    if (c) rsxFree(c);
-    { char b[96]; snprintf(b,sizeof(b),"[CK] canary %s OK p=%p\n", tag ? tag : "?", c); fputs(b,stdout); fflush(stdout); }
-}
-
 void GFX_CreateQuadResource(Quad* quad)
 {
+    Canary("quad-create");
     if (quad == nullptr) return;
     QuadResource* r = quad->GetResource();
     if (r == nullptr) return;
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, Quad::kMaxQuadVertices * sizeof(RsxUIVertex));
+    Canary("quad-create-done");
 }
 void GFX_DestroyQuadResource(Quad* quad)
 {
@@ -1062,6 +1068,10 @@ void GFX_UpdateQuadResourceVertexData(Quad* quad)
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, n * sizeof(RsxUIVertex));
     if (r->mVertexData == nullptr) return;
     RepackUI(quad->GetVertices(), n, (RsxUIVertex*)r->mVertexData);
+    { static int d=0; if(d<3){ const VertexUI* v=quad->GetVertices(); char b[192];
+        snprintf(b,sizeof(b),"[CK] QuadUpd n=%u v0=(%.1f,%.1f) uv0=(%.2f,%.2f) col0=%08X\n",
+        n, v[0].mPosition.x, v[0].mPosition.y, v[0].mTexcoord.x, v[0].mTexcoord.y, v[0].mColor);
+        fputs(b,stdout); fflush(stdout); ++d; } }
 }
 void GFX_DrawQuad(Quad* quad)
 {
@@ -1075,15 +1085,21 @@ void GFX_DrawQuad(Quad* quad)
     const uint32_t nv = quad->GetNumVertices();
     const glm::mat4 model = WidgetModel(quad);
     const glm::vec4 col = quad->GetColor();
+    { static int d=0; if(d<3){ const RsxUIVertex* v=(const RsxUIVertex*)r->mVertexData; char b[224];
+        snprintf(b,sizeof(b),"[CK] DrawQuad nv=%u tex=%s col=(%.2f,%.2f,%.2f,%.2f) v0=(%.1f,%.1f) model d=(%.2f,%.2f) t=(%.1f,%.1f)\n",
+        nv, tex?"Y":"N", col.r,col.g,col.b,col.a, v[0].x, v[0].y, model[0][0], model[1][1], model[3][0], model[3][1]);
+        fputs(b,stdout); fflush(stdout); ++d; } }
     DrawUI((const RsxUIVertex*)r->mVertexData, nv, GCM_TYPE_TRIANGLE_FAN, col, tex, model);
 }
 
 void GFX_CreateQuadBorderResource(Quad* quad)
 {
+    Canary("qborder-create");
     if (quad == nullptr) return;
     QuadResource* r = quad->GetBorderResource();
     if (r == nullptr) return;
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, Quad::kMaxQuadVertices * sizeof(RsxUIVertex));
+    Canary("qborder-create-done");
 }
 void GFX_DestroyQuadBorderResource(Quad* quad)
 {
@@ -1127,6 +1143,7 @@ void GFX_DestroyTextResource(Text* text)
 }
 void GFX_UpdateTextResourceVertexData(Text* text)
 {
+    Canary("text-update");
     if (text == nullptr) return;
     TextResource* r = text->GetResource();
     if (r == nullptr) return;
@@ -1135,6 +1152,7 @@ void GFX_UpdateTextResourceVertexData(Text* text)
 
     const uint32_t verts = numCharsAlloc * TEXT_VERTS_PER_CHAR;
     const uint32_t bytes = verts * sizeof(RsxUIVertex);
+    Canary("text-update-alloc");
     if (r->mVertexCapacity < bytes)
     {
         if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
@@ -1224,6 +1242,7 @@ void GFX_DrawPoly(Poly* poly)
 // the mesh resource + skinned verts from the comp resource, via DrawLitMesh.
 void GFX_CreateSkeletalMeshResource(SkeletalMesh* skeletalMesh, uint32_t /*numVertices*/, VertexSkinned* /*vertices*/, uint32_t numIndices, IndexType* indices)
 {
+    Canary(skeletalMesh ? ("skel-" + skeletalMesh->GetName()).c_str() : "skel-null");
     if (skeletalMesh == nullptr || indices == nullptr || numIndices == 0) return;
     SkeletalMeshResource* r = skeletalMesh->GetResource();
     if (r == nullptr) return;
@@ -1364,6 +1383,11 @@ void GFX_UpdateParticleCompVertexBuffer(Particle3D* particleComp, const std::vec
     }
     if (r->mVertexData == nullptr) { r->mNumVertices = 0; return; }
 
+    // Engine pre-divides particle vertex color (RGBA) by the renderer's color
+    // scale (an HDR trick to fit >1.0 colours in 8-bit); ForwardParticle.vert
+    // multiplies it back by mColorScale. Do the same here or sprites come out
+    // at half brightness / half alpha (dim, dark-transparent).
+    const float colorScale = Renderer::Get()->GetColorScale();
     // Quad corners 0=TL 1=BL 2=TR 3=BR → triangles (0,1,2)(2,1,3).
     static const int kIdx[6] = { 0, 1, 2, 2, 1, 3 };
     RsxPartVertex* dst = (RsxPartVertex*)r->mVertexData;
@@ -1377,10 +1401,10 @@ void GFX_UpdateParticleCompVertexBuffer(Particle3D* particleComp, const std::vec
             d.x = s.mPosition.x; d.y = s.mPosition.y; d.z = s.mPosition.z;
             d.u = s.mTexcoord.x; d.v = s.mTexcoord.y;
             const uint32_t c = s.mColor;   // engine packs R in the low byte
-            d.r = float(c & 0xFF)         / 255.0f;
-            d.g = float((c >> 8)  & 0xFF) / 255.0f;
-            d.b = float((c >> 16) & 0xFF) / 255.0f;
-            d.a = float((c >> 24) & 0xFF) / 255.0f;
+            d.r = float(c & 0xFF)         / 255.0f * colorScale;
+            d.g = float((c >> 8)  & 0xFF) / 255.0f * colorScale;
+            d.b = float((c >> 16) & 0xFF) / 255.0f * colorScale;
+            d.a = float((c >> 24) & 0xFF) / 255.0f * colorScale;
         }
     }
     r->mNumVertices  = outVerts;
@@ -1398,16 +1422,22 @@ void GFX_DrawParticleComp(Particle3D* particleComp)
     const BlendMode blend = mat ? mat->GetBlendMode() : BlendMode::Translucent;
     const bool localSpace = particleComp->GetUseLocalSpace();
 
-    // Blend on, depth test on but no depth write (translucent sprites shouldn't
-    // occlude each other). Additive uses ONE, else src/one-minus-src alpha.
-    rsxSetBlendEnable(gCtx, GCM_TRUE);
-    rsxSetBlendFunc(gCtx, GCM_SRC_ALPHA,
-                    (blend == BlendMode::Additive) ? GCM_ONE : GCM_ONE_MINUS_SRC_ALPHA,
-                    GCM_SRC_ALPHA,
-                    (blend == BlendMode::Additive) ? GCM_ONE : GCM_ONE_MINUS_SRC_ALPHA);
-    rsxSetBlendEquation(gCtx, GCM_FUNC_ADD, GCM_FUNC_ADD);
+    // Honour the material's blend mode, matching the desktop pipeline. Opaque/
+    // Masked particles render solid (blend off, depth write on) — the engine's
+    // default P_DefaultParticle uses M_DefaultUnlit (Opaque), so its sprites are
+    // solid colour squares, NOT alpha-faded (force-blending them washed the
+    // colour out over a bright sky → looked grey). Only Translucent/Additive
+    // blend, and those skip depth write so overlapping sprites don't occlude.
+    const bool blended = (blend == BlendMode::Translucent || blend == BlendMode::Additive);
+    rsxSetBlendEnable(gCtx, blended ? GCM_TRUE : GCM_FALSE);
+    if (blended)
+    {
+        const u32 dstFactor = (blend == BlendMode::Additive) ? GCM_ONE : GCM_ONE_MINUS_SRC_ALPHA;
+        rsxSetBlendFunc(gCtx, GCM_SRC_ALPHA, dstFactor, GCM_SRC_ALPHA, dstFactor);
+        rsxSetBlendEquation(gCtx, GCM_FUNC_ADD, GCM_FUNC_ADD);
+    }
     rsxSetDepthTestEnable(gCtx, GCM_TRUE);
-    rsxSetDepthWriteEnable(gCtx, GCM_FALSE);
+    rsxSetDepthWriteEnable(gCtx, blended ? GCM_FALSE : GCM_TRUE);
     rsxSetCullFaceEnable(gCtx, GCM_FALSE);
 
     const glm::mat4 model = localSpace ? particleComp->GetTransform() : glm::mat4(1.0f);
