@@ -118,10 +118,16 @@ extern "C" void __assert_func(const char* file, int line, const char* func, cons
     for (;;) {}
 }
 
-// -fstack-protector trip lands here.
+// -fstack-protector trip lands here. Log the return address (in the smashing
+// function's epilogue) so addr2line on our fixed-base .text (0x10240) names the
+// culprit. __stack_chk_guard must be defined too (newlib on PSL1GHT doesn't).
+extern "C" { void* __stack_chk_guard = (void*)0x00595e5a5a5a5a5aULL; }
 extern "C" void __stack_chk_fail(void)
 {
-    Ps3TtyRaw("[STACK_CHK_FAIL] stack smashing detected\n");
+    void* ra = __builtin_return_address(0);
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "[STACK_CHK_FAIL] smash in caller ra=%p\n", ra);
+    Ps3TtyRaw(buf);
     for (;;) {}
 }
 

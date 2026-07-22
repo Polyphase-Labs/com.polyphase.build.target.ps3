@@ -291,6 +291,19 @@ namespace
         gFirstFlip = 0;
     }
 
+    // RPCS3 poisons fresh memory with 0xABADCAFE. __wrap_malloc zeroes malloc/
+    // new, but rsxMemalign (RSX/GPU pool) is NOT wrapped, so its buffers come
+    // back poisoned. A buffer that is allocated but not fully written is then
+    // read/drawn as poison — garbage geometry, and poison interpreted as a
+    // pointer/index is a wild write. Zero every RSX allocation, same mitigation
+    // the heap gets. Route ALL rsxMemalign through here.
+    void* RsxZAlloc(u32 align, u32 size)
+    {
+        void* p = rsxMemalign(align, size);
+        if (p != nullptr) memset(p, 0, size);
+        return p;
+    }
+
     // ---- Shaders + textures (Phase 2) -----------------------------------
 
     void LoadShaders()
@@ -304,7 +317,7 @@ namespace
 
         void* uiFpUcode = nullptr; u32 uiFpSize = 0;
         rsxFragmentProgramGetUCode(gUiFp, &uiFpUcode, &uiFpSize);
-        gUiFpBuffer = (u32*)rsxMemalign(64, uiFpSize);
+        gUiFpBuffer = (u32*)RsxZAlloc(64, uiFpSize);
         memcpy(gUiFpBuffer, uiFpUcode, uiFpSize);
         rsxAddressToOffset(gUiFpBuffer, &gUiFpOffset);
         gUiTexUnit = rsxFragmentProgramGetAttrib(gUiFp, "texture");
@@ -319,7 +332,7 @@ namespace
 
         void* meshFpUcode = nullptr; u32 meshFpSize = 0;
         rsxFragmentProgramGetUCode(gMeshFp, &meshFpUcode, &meshFpSize);
-        gMeshFpBuffer = (u32*)rsxMemalign(64, meshFpSize);
+        gMeshFpBuffer = (u32*)RsxZAlloc(64, meshFpSize);
         memcpy(gMeshFpBuffer, meshFpUcode, meshFpSize);
         rsxAddressToOffset(gMeshFpBuffer, &gMeshFpOffset);
         gMeshTexUnit  = rsxFragmentProgramGetAttrib(gMeshFp, "texture");
@@ -339,7 +352,7 @@ namespace
 
         void* partFpUcode = nullptr; u32 partFpSize = 0;
         rsxFragmentProgramGetUCode(gPartFp, &partFpUcode, &partFpSize);
-        gPartFpBuffer = (u32*)rsxMemalign(64, partFpSize);
+        gPartFpBuffer = (u32*)RsxZAlloc(64, partFpSize);
         memcpy(gPartFpBuffer, partFpUcode, partFpSize);
         rsxAddressToOffset(gPartFpBuffer, &gPartFpOffset);
         gPartTexUnit = rsxFragmentProgramGetAttrib(gPartFp, "texture");
@@ -351,7 +364,7 @@ namespace
 
     void MakeWhiteTexture()
     {
-        gWhiteTex = (u32*)rsxMemalign(128, 4 * 4 * 4);
+        gWhiteTex = (u32*)RsxZAlloc(128, 4 * 4 * 4);
         if (gWhiteTex == nullptr) return;
         for (u32 i = 0; i < 16; ++i) gWhiteTex[i] = 0xFFFFFFFFu;   // ARGB white
         rsxAddressToOffset(gWhiteTex, &gWhiteTexOffset);
@@ -579,20 +592,8 @@ namespace
     {
         if (*data != nullptr && *cap >= bytes) return;
         if (*data != nullptr) { rsxFree(*data); *data = nullptr; }
-        *data = rsxMemalign(128, bytes);
+        *data = RsxZAlloc(128, bytes);
         *cap  = (*data != nullptr) ? bytes : 0;
-    }
-
-    // [CK] TEMP diagnostic: exercise the RSX heap allocator. If the heap context
-    // (loaded from a GOT slot) has been corrupted by a prior wild write, this
-    // rsxMemalign faults HERE — so the last "canary <tag> OK" logged before the
-    // freeze pins which scene-load step corrupted the heap. Addon-local only.
-    void Canary(const char* tag)
-    {
-        { char b[96]; snprintf(b, sizeof(b), "[CK] canary %s enter\n", tag ? tag : "?"); fputs(b, stdout); fflush(stdout); }
-        void* c = rsxMemalign(128, 16);
-        if (c) rsxFree(c);
-        { char b[96]; snprintf(b, sizeof(b), "[CK] canary %s OK p=%p\n", tag ? tag : "?", c); fputs(b, stdout); fflush(stdout); }
     }
 }
 
@@ -644,12 +645,12 @@ void GFX_Initialize()
 
     for (u32 i = 0; i < 2; ++i)
     {
-        gColorBuffer[i] = (u32*)rsxMemalign(64, gDisplayHeight * gColorPitch);
+        gColorBuffer[i] = (u32*)RsxZAlloc(64, gDisplayHeight * gColorPitch);
         if (gColorBuffer[i] == nullptr) { LogError("GFX_Initialize: color %u alloc failed", (unsigned)i); return; }
         rsxAddressToOffset(gColorBuffer[i], &gColorOffset[i]);
         gcmSetDisplayBuffer(i, gColorOffset[i], gColorPitch, gDisplayWidth, gDisplayHeight);
     }
-    gDepthBuffer = (u32*)rsxMemalign(64, gDisplayHeight * gDepthPitch);
+    gDepthBuffer = (u32*)RsxZAlloc(64, gDisplayHeight * gDepthPitch);
     if (gDepthBuffer == nullptr) { LogError("GFX_Initialize: depth alloc failed"); return; }
     rsxAddressToOffset(gDepthBuffer, &gDepthOffset);
 
@@ -684,7 +685,6 @@ void GFX_BeginFrame()
     // advancement). Must run every frame or RPCS3's display subsystem backs up.
     sysUtilCheckCallback();
     if (!gInitialized) return;
-    { static int f=0; if (f<2) { char b[32]; snprintf(b,sizeof(b),"frame%d",f); Canary(b); ++f; } }
 
     // Clear the back buffer to the engine's clear colour, then leave 3D state
     // ready for the Forward pass. Real draws land between here and EndFrame.
@@ -812,7 +812,6 @@ void GFX_EndGpuTimestamp(const char* /*name*/) {}
 void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& /*data*/)
 {
     if (texture == nullptr) return;
-    Canary(("tex-" + texture->GetName()).c_str());
     TextureResource* r = texture->GetResource();
     if (r == nullptr) return;
 
@@ -842,7 +841,7 @@ void GFX_CreateTextureResource(Texture* texture, std::vector<uint8_t>& /*data*/)
     const uint32_t bufH  = srcH;
     const uint32_t bytes = bufW * bufH * 4u;
 
-    u32* dst = (u32*)rsxMemalign(128, bytes);
+    u32* dst = (u32*)RsxZAlloc(128, bytes);
     if (dst == nullptr) return;
 
     // RGBA8 (R,G,B,A byte order) → A8R8G8B8 (A,R,G,B byte order) for the RSX
@@ -920,7 +919,6 @@ void GFX_DestroyMaterialResource(Material* /*material*/) {}
 
 void GFX_CreateStaticMeshResource(StaticMesh* staticMesh, bool hasColor, uint32_t numVertices, void* vertices, uint32_t numIndices, IndexType* indices)
 {
-    Canary(staticMesh ? ("smesh-" + staticMesh->GetName()).c_str() : "smesh-null");
     if (staticMesh == nullptr || vertices == nullptr || indices == nullptr) return;
     if (numVertices == 0 || numIndices == 0) return;
 
@@ -932,8 +930,8 @@ void GFX_CreateStaticMeshResource(StaticMesh* staticMesh, bool hasColor, uint32_
     const uint32_t vBytes = stride * numVertices;
     const uint32_t iBytes = sizeof(IndexType) * numIndices;
 
-    void* vBuf = rsxMemalign(128, vBytes);
-    void* iBuf = rsxMemalign(128, iBytes);
+    void* vBuf = RsxZAlloc(128, vBytes);
+    void* iBuf = RsxZAlloc(128, iBytes);
     if (vBuf == nullptr || iBuf == nullptr)
     {
         if (vBuf) rsxFree(vBuf);
@@ -1043,12 +1041,10 @@ void GFX_DrawStaticMeshComp(StaticMesh3D* comp, StaticMesh* meshOverride)
 
 void GFX_CreateQuadResource(Quad* quad)
 {
-    Canary("quad-create");
     if (quad == nullptr) return;
     QuadResource* r = quad->GetResource();
     if (r == nullptr) return;
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, Quad::kMaxQuadVertices * sizeof(RsxUIVertex));
-    Canary("quad-create-done");
 }
 void GFX_DestroyQuadResource(Quad* quad)
 {
@@ -1068,10 +1064,6 @@ void GFX_UpdateQuadResourceVertexData(Quad* quad)
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, n * sizeof(RsxUIVertex));
     if (r->mVertexData == nullptr) return;
     RepackUI(quad->GetVertices(), n, (RsxUIVertex*)r->mVertexData);
-    { static int d=0; if(d<3){ const VertexUI* v=quad->GetVertices(); char b[192];
-        snprintf(b,sizeof(b),"[CK] QuadUpd n=%u v0=(%.1f,%.1f) uv0=(%.2f,%.2f) col0=%08X\n",
-        n, v[0].mPosition.x, v[0].mPosition.y, v[0].mTexcoord.x, v[0].mTexcoord.y, v[0].mColor);
-        fputs(b,stdout); fflush(stdout); ++d; } }
 }
 void GFX_DrawQuad(Quad* quad)
 {
@@ -1085,21 +1077,15 @@ void GFX_DrawQuad(Quad* quad)
     const uint32_t nv = quad->GetNumVertices();
     const glm::mat4 model = WidgetModel(quad);
     const glm::vec4 col = quad->GetColor();
-    { static int d=0; if(d<3){ const RsxUIVertex* v=(const RsxUIVertex*)r->mVertexData; char b[224];
-        snprintf(b,sizeof(b),"[CK] DrawQuad nv=%u tex=%s col=(%.2f,%.2f,%.2f,%.2f) v0=(%.1f,%.1f) model d=(%.2f,%.2f) t=(%.1f,%.1f)\n",
-        nv, tex?"Y":"N", col.r,col.g,col.b,col.a, v[0].x, v[0].y, model[0][0], model[1][1], model[3][0], model[3][1]);
-        fputs(b,stdout); fflush(stdout); ++d; } }
     DrawUI((const RsxUIVertex*)r->mVertexData, nv, GCM_TYPE_TRIANGLE_FAN, col, tex, model);
 }
 
 void GFX_CreateQuadBorderResource(Quad* quad)
 {
-    Canary("qborder-create");
     if (quad == nullptr) return;
     QuadResource* r = quad->GetBorderResource();
     if (r == nullptr) return;
     EnsureUIBuffer(&r->mVertexData, &r->mVertexCapacity, Quad::kMaxQuadVertices * sizeof(RsxUIVertex));
-    Canary("qborder-create-done");
 }
 void GFX_DestroyQuadBorderResource(Quad* quad)
 {
@@ -1143,7 +1129,6 @@ void GFX_DestroyTextResource(Text* text)
 }
 void GFX_UpdateTextResourceVertexData(Text* text)
 {
-    Canary("text-update");
     if (text == nullptr) return;
     TextResource* r = text->GetResource();
     if (r == nullptr) return;
@@ -1152,11 +1137,10 @@ void GFX_UpdateTextResourceVertexData(Text* text)
 
     const uint32_t verts = numCharsAlloc * TEXT_VERTS_PER_CHAR;
     const uint32_t bytes = verts * sizeof(RsxUIVertex);
-    Canary("text-update-alloc");
     if (r->mVertexCapacity < bytes)
     {
         if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
-        r->mVertexData = rsxMemalign(128, bytes);
+        r->mVertexData = RsxZAlloc(128, bytes);
         r->mVertexCapacity = (r->mVertexData != nullptr) ? bytes : 0;
         r->mNumBufferCharsAllocated = (r->mVertexData != nullptr) ? numCharsAlloc : 0;
     }
@@ -1242,12 +1226,11 @@ void GFX_DrawPoly(Poly* poly)
 // the mesh resource + skinned verts from the comp resource, via DrawLitMesh.
 void GFX_CreateSkeletalMeshResource(SkeletalMesh* skeletalMesh, uint32_t /*numVertices*/, VertexSkinned* /*vertices*/, uint32_t numIndices, IndexType* indices)
 {
-    Canary(skeletalMesh ? ("skel-" + skeletalMesh->GetName()).c_str() : "skel-null");
     if (skeletalMesh == nullptr || indices == nullptr || numIndices == 0) return;
     SkeletalMeshResource* r = skeletalMesh->GetResource();
     if (r == nullptr) return;
     const uint32_t iBytes = sizeof(IndexType) * numIndices;
-    void* iBuf = rsxMemalign(128, iBytes);
+    void* iBuf = RsxZAlloc(128, iBytes);
     if (iBuf == nullptr) return;
     memcpy(iBuf, indices, iBytes);
     r->mIndexData  = iBuf;
@@ -1289,7 +1272,7 @@ void GFX_ReallocateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp
         return;
     }
     if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
-    r->mVertexData     = rsxMemalign(128, needed);
+    r->mVertexData     = RsxZAlloc(128, needed);
     r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
     r->mNumVertices    = (r->mVertexData != nullptr) ? numVertices : 0;
     r->mVertexStride   = stride;
@@ -1305,7 +1288,7 @@ void GFX_UpdateSkeletalMeshCompVertexBuffer(SkeletalMesh3D* skeletalMeshComp, co
     if (r->mVertexData == nullptr || r->mVertexCapacity < needed)
     {
         if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
-        r->mVertexData     = rsxMemalign(128, needed);
+        r->mVertexData     = RsxZAlloc(128, needed);
         r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
     }
     if (r->mVertexData == nullptr) return;
@@ -1378,7 +1361,7 @@ void GFX_UpdateParticleCompVertexBuffer(Particle3D* particleComp, const std::vec
     if (r->mVertexData == nullptr || r->mVertexCapacity < needed)
     {
         if (r->mVertexData != nullptr) { rsxFree(r->mVertexData); r->mVertexData = nullptr; }
-        r->mVertexData     = rsxMemalign(128, needed);
+        r->mVertexData     = RsxZAlloc(128, needed);
         r->mVertexCapacity = (r->mVertexData != nullptr) ? needed : 0;
     }
     if (r->mVertexData == nullptr) { r->mNumVertices = 0; return; }
