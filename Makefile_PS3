@@ -268,9 +268,16 @@ STDCXX_C99 = -D_GLIBCXX_USE_C99_STDIO=1 -D_GLIBCXX_USE_C99_STDLIB=1
 # reasonable size/speed while disabling that whole tier. Also drop strict
 # aliasing (correct for the engine's memcpy/byte-punning) and modulo-sched.
 CODEGEN_SAFE = -fno-modulo-sched -fno-strict-aliasing
-# [CK] TEMP diagnostic: catch the UI stack-smash — every function gets a canary,
-# so the function whose local buffer overflows trips __stack_chk_fail (logs its
-# return address) instead of silently clobbering the backchain. Remove after.
+# Mitigation for a latent engine uninitialized-read wild write exposed under
+# RPCS3 (0xABADCAFE poison): with UI (Canvas/Text/Font) in the scene, a stray
+# store overwrites the RSX heap-allocator descriptor pointer with a .rodata
+# Lua-binding-name address, so the next rsxMemalign spinlock-locks read-only
+# memory and hard-faults. The bug is uninitialized-stack-derived and moves with
+# memory layout; -fstack-protector-all reliably relocates it away from the heap
+# descriptor (frame canaries change the leftover-stack contents the buggy read
+# picks up). Not a root-cause fix (that's engine-side), but stable in practice
+# and legitimate hardening. Pairs with RsxZAlloc (zeroes RSX allocations) in
+# Graphics_PS3RSX.cpp. Revisit if the engine bug is fixed upstream.
 CODEGEN_SAFE += -fstack-protector-all
 # -O0 confirmed the scene-load crash is NOT optimizer miscompilation (it's a
 # real uninitialized-read / logic bug that RPCS3 exposes via 0xABADCAFE memory

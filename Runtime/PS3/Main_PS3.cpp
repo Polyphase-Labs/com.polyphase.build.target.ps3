@@ -118,9 +118,10 @@ extern "C" void __assert_func(const char* file, int line, const char* func, cons
     for (;;) {}
 }
 
-// -fstack-protector trip lands here. Log the return address (in the smashing
-// function's epilogue) so addr2line on our fixed-base .text (0x10240) names the
-// culprit. __stack_chk_guard must be defined too (newlib on PSL1GHT doesn't).
+// The build uses -fstack-protector-all (see Makefile_PS3 CODEGEN_SAFE). newlib
+// on PSL1GHT provides neither the guard value nor the failure handler, so define
+// both here. A genuine canary trip logs the return address (in the tripping
+// function's epilogue) — addr2line on our fixed-base .text (0x10240) names it.
 extern "C" { void* __stack_chk_guard = (void*)0x00595e5a5a5a5a5aULL; }
 extern "C" void __stack_chk_fail(void)
 {
@@ -216,7 +217,7 @@ static std::string Ps3IniValue(const std::string& text, const char* key)
 
 void OctPreInitialize(EngineConfig& config)
 {
-    Ps3_BootLog("[CK] OctPreInitialize enter");
+    Ps3_BootLog("OctPreInitialize enter");
     GetEngineState()->mStandalone = true;
 
     // Force 720p logical size. Both the EngineConfig (checked by most code)
@@ -239,7 +240,7 @@ void OctPreInitialize(EngineConfig& config)
     {
         char* iniData = nullptr; uint32_t iniSize = 0;
         SYS_AcquireFileData("Config.ini", false, 0, iniData, iniSize);
-        Ps3_BootLog(iniData != nullptr ? "[CK] Config.ini read OK" : "[CK] Config.ini read FAIL");
+        Ps3_BootLog(iniData != nullptr ? "Config.ini read OK" : "Config.ini read FAIL");
         if (iniData != nullptr && iniSize > 0)
         {
             const std::string ini(iniData, iniSize);
@@ -247,7 +248,7 @@ void OctPreInitialize(EngineConfig& config)
 
             const std::string project = Ps3IniValue(ini, "Project");
             const std::string scene   = Ps3IniValue(ini, "DefaultScene");
-            Ps3_BootLog(("[CK] parsed Project='" + project + "' Scene='" + scene + "'").c_str());
+            Ps3_BootLog(("parsed Project='" + project + "' Scene='" + scene + "'").c_str());
             if (!project.empty())
             {
                 config.mProjectName = project;
@@ -271,14 +272,14 @@ void OctPreInitialize(EngineConfig& config)
 #if PS3_RENDER_SMOKE_TEST
             config.mDefaultScene = "";
 #endif
-            Ps3_BootLog("[CK] config members set");
+            Ps3_BootLog("config members set");
         }
         else
         {
             LogWarning("[PS3] Config.ini not found under USRDIR — no project/scene will load");
         }
     }
-    Ps3_BootLog("[CK] OctPreInitialize exit");
+    Ps3_BootLog("OctPreInitialize exit");
 }
 
 void OctPostInitialize()
